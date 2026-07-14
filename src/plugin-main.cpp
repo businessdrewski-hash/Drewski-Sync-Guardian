@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Sync Guardian v0.2.3 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
+// Sync Guardian v0.2.4 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -45,19 +45,24 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("sync-guardian", "en-US")
 
 #ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "0.2.3"
+#define PLUGIN_VERSION "0.2.4"
 #endif
 
 namespace {
 
 constexpr const char *kDockId = "sync_guardian_dock";
 constexpr const char *kDistroAvSourceId = "ndi_source";
+constexpr const char *kVideoProbeFilterId = "sync_guardian_video_timestamp_probe";
+constexpr const char *kVideoProbeFilterName = "[Sync Guardian] Video Timestamp Probe";
+constexpr const char *kVideoProbeTokenKey = "sync_guardian_runtime_token";
 constexpr const char *kPropSource = "ndi_source_name";
 constexpr const char *kPropLatency = "latency";
 constexpr const char *kPropFrameSync = "ndi_framesync";
@@ -76,6 +81,8 @@ constexpr uint64_t kResetLimitWindowNs = 60ULL * 60ULL * kNsPerSecond;
 constexpr uint64_t kObserveRepeatNs = 30ULL * kNsPerSecond;
 constexpr uint64_t kJumpEvidenceWindowNs = 5ULL * kNsPerSecond;
 constexpr uint64_t kStallConfirmNs = 500ULL * kNsPerMs;
+constexpr uint64_t kFirstSampleGraceNs = 2ULL * kNsPerSecond;
+constexpr uint64_t kIssueEpisodeMergeNs = 60ULL * kNsPerSecond;
 constexpr int kRefreshIntervalMs = 250;
 
 static int64_t signedDelta(uint64_t newer, uint64_t older)
@@ -234,11 +241,15 @@ struct SourceState {
 	std::atomic<int64_t> lastAudioJumpErrorNs{0};
 	std::atomic<uint64_t> audioJumpCount{0};
 
-	uint64_t lastVideoTimestampNs = 0;
-	uint64_t lastVideoWallNs = 0;
-	uint64_t lastVideoJumpWallNs = 0;
-	int64_t lastVideoJumpErrorNs = 0;
-	uint64_t videoJumpCount = 0;
+	std::atomic<uint64_t> lastVideoTimestampNs{0};
+	std::atomic<uint64_t> lastVideoWallNs{0};
+	std::atomic<uint64_t> lastVideoArrivalWallNs{0};
+	std::atomic<uint64_t> lastVideoJumpWallNs{0};
+	std::atomic<int64_t> lastVideoJumpErrorNs{0};
+	std::atomic<uint64_t> videoJumpCount{0};
+	std::atomic<uint64_t> firstValidSampleWallNs{0};
+	obs_weak_source_t *videoProbeWeak = nullptr;
+	uint64_t videoProbeToken = 0;
 
 	uint64_t resetCount = 0;
 	uint64_t recoveryCount = 0;
@@ -249,6 +260,92 @@ struct SourceState {
 	bool active = false;
 	bool showing = false;
 };
+
+std::mutex g_videoProbeRegistryMutex;
+std::unordered_map<uint64_t, SourceState *> g_videoProbeRegistry;
+std::atomic<uint64_t> g_nextVideoProbeToken{1};
+
+struct VideoProbeData {
+	SourceState *state = nullptr;
+};
+
+static const char *videoProbeName(void *)
+{
+	return "Sync Guardian Video Timestamp Probe";
+}
+
+static void *videoProbeCreate(obs_data_t *settings, obs_source_t *)
+{
+	auto *probe = new VideoProbeData();
+	const uint64_t token = static_cast<uint64_t>(obs_data_get_int(settings, kVideoProbeTokenKey));
+	std::lock_guard<std::mutex> lock(g_videoProbeRegistryMutex);
+	const auto it = g_videoProbeRegistry.find(token);
+	if (it != g_videoProbeRegistry.end())
+		probe->state = it->second;
+	return probe;
+}
+
+static void videoProbeDestroy(void *data)
+{
+	delete static_cast<VideoProbeData *>(data);
+}
+
+static obs_source_frame *videoProbeFilter(void *data, obs_source_frame *frame)
+{
+	auto *probe = static_cast<VideoProbeData *>(data);
+	if (!probe || !probe->state || !frame)
+		return frame;
+
+	SourceState *state = probe->state;
+	const uint64_t now = os_gettime_ns();
+	state->lastVideoArrivalWallNs.store(now);
+
+	const uint64_t timestamp = frame->timestamp;
+	if (!timestamp)
+		return frame;
+
+	uint64_t expectedFirst = 0;
+	state->firstValidSampleWallNs.compare_exchange_strong(expectedFirst, now);
+
+	const uint64_t previousTimestamp = state->lastVideoTimestampNs.load();
+	if (timestamp == previousTimestamp)
+		return frame;
+
+	const uint64_t previousWall = state->lastVideoWallNs.load();
+	state->lastVideoTimestampNs.store(timestamp);
+	state->lastVideoWallNs.store(now);
+
+	if (!previousTimestamp || !previousWall)
+		return frame;
+
+	const int64_t timestampDelta = signedDelta(timestamp, previousTimestamp);
+	const int64_t wallDelta = signedDelta(now, previousWall);
+	const int64_t error = timestampDelta - wallDelta;
+	if (std::llabs(error) < static_cast<int64_t>(kJumpThresholdNs))
+		return frame;
+
+	const uint64_t previousJump = state->lastVideoJumpWallNs.load();
+	if (previousJump && now - previousJump < kJumpCooldownNs)
+		return frame;
+
+	state->lastVideoJumpWallNs.store(now);
+	state->lastVideoJumpErrorNs.store(error);
+	state->videoJumpCount.fetch_add(1);
+	return frame;
+}
+
+static void registerVideoProbeFilter()
+{
+	obs_source_info info = {};
+	info.id = kVideoProbeFilterId;
+	info.type = OBS_SOURCE_TYPE_FILTER;
+	info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
+	info.get_name = videoProbeName;
+	info.create = videoProbeCreate;
+	info.destroy = videoProbeDestroy;
+	info.filter_video = videoProbeFilter;
+	obs_register_source(&info);
+}
 
 struct ResetTicket {
 	obs_weak_source_t *weak = nullptr;
@@ -364,6 +461,8 @@ private:
 	QCheckBox *incidentReports_ = nullptr;
 
 	QComboBox *automationMode_ = nullptr;
+	QPushButton *advancedToggleButton_ = nullptr;
+	QWidget *advancedSettingsWidget_ = nullptr;
 	QCheckBox *onlyWhenOutputActive_ = nullptr;
 	QCheckBox *requireActiveSources_ = nullptr;
 	QCheckBox *enableFreezeDetection_ = nullptr;
@@ -427,6 +526,8 @@ private:
 	std::array<uint64_t, 3> loggedJumpCounts_{0, 0, 0};
 	std::array<uint64_t, 7> issueEpisodeCounts_{0, 0, 0, 0, 0, 0, 0};
 	IssueKind activeSummaryIssue_ = IssueKind::None;
+	IssueKind lastCountedIssue_ = IssueKind::None;
+	uint64_t lastCountedIssueNs_ = 0;
 	QString currentSummaryState_ = QStringLiteral("Starting");
 	QString lastIssueSummary_;
 	QDateTime lastIssueTime_;
@@ -477,9 +578,16 @@ private:
 		sourceForm->setContentsMargins(6, 5, 6, 6);
 		sourceForm->setHorizontalSpacing(6);
 		sourceForm->setVerticalSpacing(3);
+		auto *sourceHelp = new QLabel(QStringLiteral(
+			"Choose the DistroAV receiver sources on this streaming PC. Video timing is read by a pass-through timestamp probe."),
+			sourceBox);
+		sourceHelp->setWordWrap(true);
+		sourceHelp->setStyleSheet(QStringLiteral("color: palette(mid);"));
+		sourceForm->addRow(sourceHelp);
 		for (size_t i = 0; i < sourceCombos_.size(); ++i) {
 			sourceCombos_[i] = new QComboBox(sourceBox);
 			sourceCombos_[i]->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+			sourceCombos_[i]->setToolTip(QStringLiteral("Select the OBS DistroAV source used for this role. Use Rescan Sources after adding or renaming a source."));
 			sourceForm->addRow(states_[i].role + QStringLiteral(":"), sourceCombos_[i]);
 			QObject::connect(sourceCombos_[i], QOverload<int>::of(&QComboBox::currentIndexChanged),
 					 [this, i](int) {
@@ -499,19 +607,46 @@ private:
 		automationMode_->addItem(QStringLiteral("Observe only"), static_cast<int>(AutomationMode::Observe));
 		automationMode_->addItem(QStringLiteral("Ask before resetting"), static_cast<int>(AutomationMode::Ask));
 		automationMode_->addItem(QStringLiteral("Fully automatic"), static_cast<int>(AutomationMode::Automatic));
+		automationMode_->setToolTip(QStringLiteral(
+			"Observe only is safest. Ask mode offers a confirmation prompt. Fully automatic performs the highlighted recovery after all safeguards pass."));
 		automationForm->addRow(QStringLiteral("Operating mode:"), automationMode_);
 
-		onlyWhenOutputActive_ = new QCheckBox(QStringLiteral("Only act while output is active"), automationBox);
+		auto *simpleHelp = new QLabel(QStringLiteral(
+			"Recommended: begin with Observe only. Sync Guardian waits for real video and audio timestamps before judging sync."),
+			automationBox);
+		simpleHelp->setWordWrap(true);
+		simpleHelp->setStyleSheet(QStringLiteral("color: palette(mid);"));
+		automationForm->addRow(simpleHelp);
+
+		advancedToggleButton_ = new QPushButton(QStringLiteral("Show advanced detection settings"), automationBox);
+		advancedToggleButton_->setCheckable(true);
+		advancedToggleButton_->setChecked(false);
+		advancedToggleButton_->setToolTip(QStringLiteral(
+			"Shows timing thresholds and safety limits. The defaults are deliberately conservative and normally do not need adjustment."));
+		automationForm->addRow(advancedToggleButton_);
+
+		advancedSettingsWidget_ = new QWidget(automationBox);
+		auto *advancedForm = new QFormLayout(advancedSettingsWidget_);
+		advancedForm->setContentsMargins(0, 2, 0, 0);
+		advancedForm->setHorizontalSpacing(6);
+		advancedForm->setVerticalSpacing(3);
+
+		onlyWhenOutputActive_ = new QCheckBox(QStringLiteral("Only act while output is active"), advancedSettingsWidget_);
 		onlyWhenOutputActive_->setChecked(true);
-		requireActiveSources_ = new QCheckBox(QStringLiteral("Require active/showing sources"), automationBox);
+		requireActiveSources_ = new QCheckBox(QStringLiteral("Require active/showing sources"), advancedSettingsWidget_);
 		requireActiveSources_->setChecked(true);
-		enableFreezeDetection_ = new QCheckBox(QStringLiteral("Detect stalls/frozen video"), automationBox);
+		enableFreezeDetection_ = new QCheckBox(QStringLiteral("Detect stalls/frozen video"), advancedSettingsWidget_);
 		enableFreezeDetection_->setChecked(true);
-		enableDriftDetection_ = new QCheckBox(QStringLiteral("Detect persistent A/V drift"), automationBox);
+		enableDriftDetection_ = new QCheckBox(QStringLiteral("Detect persistent A/V drift"), advancedSettingsWidget_);
 		enableDriftDetection_->setChecked(true);
-		autoEscalate_ = new QCheckBox(QStringLiteral("Escalate failed reset to full-group rebuild"), automationBox);
+		autoEscalate_ = new QCheckBox(QStringLiteral("Escalate failed reset to full-group rebuild"), advancedSettingsWidget_);
 		autoEscalate_->setChecked(true);
-		auto *automationChecks = new QWidget(automationBox);
+		onlyWhenOutputActive_->setToolTip(QStringLiteral("Prevents automatic recovery while neither streaming nor recording. Monitoring still continues."));
+		requireActiveSources_->setToolTip(QStringLiteral("Suppresses detection when the mapped sources are inactive, hidden, or disabled."));
+		enableFreezeDetection_->setToolTip(QStringLiteral("Detects a timestamp or packet stream that stops while a companion stream continues."));
+		enableDriftDetection_->setToolTip(QStringLiteral("Compares the filtered video/audio timestamp relationship against the calibrated normal baseline."));
+		autoEscalate_->setToolTip(QStringLiteral("Allows one full-group rebuild if a targeted automatic reset fails verification."));
+		auto *automationChecks = new QWidget(advancedSettingsWidget_);
 		auto *automationChecksGrid = new QGridLayout(automationChecks);
 		automationChecksGrid->setContentsMargins(0, 0, 0, 0);
 		automationChecksGrid->setHorizontalSpacing(8);
@@ -521,40 +656,46 @@ private:
 		automationChecksGrid->addWidget(enableFreezeDetection_, 1, 0);
 		automationChecksGrid->addWidget(enableDriftDetection_, 1, 1);
 		automationChecksGrid->addWidget(autoEscalate_, 2, 0, 1, 2);
-		automationForm->addRow(automationChecks);
+		advancedForm->addRow(automationChecks);
 
-		videoStallMs_ = createSpin(automationBox, 250, 10000, 1000, QStringLiteral(" ms"));
-		audioStallMs_ = createSpin(automationBox, 250, 10000, 1000, QStringLiteral(" ms"));
-		driftThresholdMs_ = createSpin(automationBox, 50, 2000, 200, QStringLiteral(" ms"));
-		driftPersistenceMs_ = createSpin(automationBox, 1000, 60000, 10000, QStringLiteral(" ms"));
-		cooldownSec_ = createSpin(automationBox, 10, 3600, 180, QStringLiteral(" sec"));
-		maxAutoResetsPerHour_ = createSpin(automationBox, 1, 20, 3, QStringLiteral(" / hour"));
-		startupGraceSec_ = createSpin(automationBox, 5, 300, 30, QStringLiteral(" sec"));
-		verifyDelaySec_ = createSpin(automationBox, 2, 30, 5, QStringLiteral(" sec"));
+		videoStallMs_ = createSpin(advancedSettingsWidget_, 250, 10000, 1000, QStringLiteral(" ms"));
+		audioStallMs_ = createSpin(advancedSettingsWidget_, 250, 10000, 1000, QStringLiteral(" ms"));
+		driftThresholdMs_ = createSpin(advancedSettingsWidget_, 50, 2000, 200, QStringLiteral(" ms"));
+		driftPersistenceMs_ = createSpin(advancedSettingsWidget_, 1000, 60000, 10000, QStringLiteral(" ms"));
+		cooldownSec_ = createSpin(advancedSettingsWidget_, 10, 3600, 180, QStringLiteral(" sec"));
+		maxAutoResetsPerHour_ = createSpin(advancedSettingsWidget_, 1, 20, 3, QStringLiteral(" / hour"));
+		startupGraceSec_ = createSpin(advancedSettingsWidget_, 5, 300, 30, QStringLiteral(" sec"));
+		verifyDelaySec_ = createSpin(advancedSettingsWidget_, 2, 30, 5, QStringLiteral(" sec"));
 		videoStallMs_->setToolTip(QStringLiteral("Default 1000 ms plus a fixed 500 ms confirmation window before action."));
 		audioStallMs_->setToolTip(QStringLiteral("Default 1000 ms plus a fixed 500 ms confirmation window before action."));
 		driftThresholdMs_->setToolTip(QStringLiteral("A single timestamp jump does not trigger recovery; the filtered offset must remain beyond this value."));
 		driftPersistenceMs_->setToolTip(QStringLiteral("How long a filtered A/V offset must remain beyond the threshold before recovery is suggested."));
 		cooldownSec_->setToolTip(QStringLiteral("Minimum delay between automatic recovery attempts."));
 		maxAutoResetsPerHour_->setToolTip(QStringLiteral("Hard safety cap across targeted resets and full-group escalations."));
-		automationForm->addRow(QStringLiteral("Video stall threshold:"), videoStallMs_);
-		automationForm->addRow(QStringLiteral("Audio stall threshold:"), audioStallMs_);
-		automationForm->addRow(QStringLiteral("Persistent drift threshold:"), driftThresholdMs_);
-		automationForm->addRow(QStringLiteral("Drift must persist for:"), driftPersistenceMs_);
-		automationForm->addRow(QStringLiteral("Automatic reset cooldown:"), cooldownSec_);
-		automationForm->addRow(QStringLiteral("Maximum automatic resets:"), maxAutoResetsPerHour_);
-		automationForm->addRow(QStringLiteral("Startup/scene-change grace:"), startupGraceSec_);
-		automationForm->addRow(QStringLiteral("Recovery verification delay:"), verifyDelaySec_);
+		startupGraceSec_->setToolTip(QStringLiteral("Suppresses detection while sources start, reconnect, or settle after a scene change."));
+		verifyDelaySec_->setToolTip(QStringLiteral("How long to wait after a reset before deciding whether the source recovered."));
+		advancedForm->addRow(QStringLiteral("Video stall threshold:"), videoStallMs_);
+		advancedForm->addRow(QStringLiteral("Audio stall threshold:"), audioStallMs_);
+		advancedForm->addRow(QStringLiteral("Persistent drift threshold:"), driftThresholdMs_);
+		advancedForm->addRow(QStringLiteral("Drift must persist for:"), driftPersistenceMs_);
+		advancedForm->addRow(QStringLiteral("Automatic reset cooldown:"), cooldownSec_);
+		advancedForm->addRow(QStringLiteral("Maximum automatic resets:"), maxAutoResetsPerHour_);
+		advancedForm->addRow(QStringLiteral("Startup/scene-change grace:"), startupGraceSec_);
+		advancedForm->addRow(QStringLiteral("Recovery verification delay:"), verifyDelaySec_);
 
-		auto *calibrationButtons = new QWidget(automationBox);
+		auto *calibrationButtons = new QWidget(advancedSettingsWidget_);
 		auto *calibrationLayout = new QGridLayout(calibrationButtons);
 		calibrationLayout->setContentsMargins(0, 0, 0, 0);
 		calibrationLayout->setHorizontalSpacing(4);
 		auto *setBaseline = new QPushButton(QStringLiteral("Set Current Baseline"), calibrationButtons);
 		auto *autoCalibrate = new QPushButton(QStringLiteral("Restart Auto Calibration"), calibrationButtons);
+		setBaseline->setToolTip(QStringLiteral("Treats the current stable video/audio timestamp relationship as normal."));
+		autoCalibrate->setToolTip(QStringLiteral("Clears the current baseline and learns a new one from 30 seconds of stable data."));
 		calibrationLayout->addWidget(setBaseline, 0, 0);
 		calibrationLayout->addWidget(autoCalibrate, 0, 1);
-		automationForm->addRow(QStringLiteral("Calibration:"), calibrationButtons);
+		advancedForm->addRow(QStringLiteral("Calibration:"), calibrationButtons);
+		advancedSettingsWidget_->setVisible(false);
+		automationForm->addRow(advancedSettingsWidget_);
 		root->addWidget(automationBox);
 
 		auto *controlBox = new QGroupBox(QStringLiteral("Manual recovery"), scrollContent);
@@ -562,7 +703,7 @@ private:
 		controlGrid->setContentsMargins(6, 5, 6, 6);
 		controlGrid->setHorizontalSpacing(4);
 		controlGrid->setVerticalSpacing(3);
-		manualSuggestionLabel_ = new QLabel(QStringLiteral("Suggested manual action: none — monitoring healthy"), controlBox);
+		manualSuggestionLabel_ = new QLabel(QStringLiteral("Suggested manual action: none — monitoring healthy. Hover over a button for help."), controlBox);
 		manualSuggestionLabel_->setWordWrap(true);
 		manualSuggestionLabel_->setObjectName(QStringLiteral("SyncGuardianManualSuggestion"));
 		controlGrid->addWidget(manualSuggestionLabel_, 0, 0, 1, 2);
@@ -572,10 +713,20 @@ private:
 		resetMicButton_ = new QPushButton(QStringLiteral("Reset Mic Only"), controlBox);
 		resetBothAudioButton_ = new QPushButton(QStringLiteral("Reset Both Audio Sources"), controlBox);
 		rebuildGroupButton_ = new QPushButton(QStringLiteral("Rebuild Entire Sync Group"), controlBox);
-		auto *captureSnapshot = new QPushButton(QStringLiteral("Capture Known-Good State"), controlBox);
-		auto *restoreSnapshot = new QPushButton(QStringLiteral("Restore Last Known-Good State"), controlBox);
-		auto *markEventButton = new QPushButton(QStringLiteral("Mark Sync Event"), controlBox);
-		auto *refreshSources = new QPushButton(QStringLiteral("Refresh Source List"), controlBox);
+		auto *captureSnapshot = new QPushButton(QStringLiteral("Save Current Settings"), controlBox);
+		auto *restoreSnapshot = new QPushButton(QStringLiteral("Restore Saved Settings"), controlBox);
+		auto *markEventButton = new QPushButton(QStringLiteral("Add Log Marker"), controlBox);
+		auto *refreshSources = new QPushButton(QStringLiteral("Rescan Sources"), controlBox);
+
+		resetVideoButton_->setToolTip(QStringLiteral("Restarts only the mapped NDI video receiver. Use when video freezes or falls behind while audio remains healthy."));
+		resetDesktopButton_->setToolTip(QStringLiteral("Restarts only the mapped desktop/game audio receiver. Use when that audio stops or is the likely drifting stream."));
+		resetMicButton_->setToolTip(QStringLiteral("Restarts only the mapped microphone receiver."));
+		resetBothAudioButton_->setToolTip(QStringLiteral("Restarts both mapped NDI audio receivers together. Use when both audio streams are stale or need to be realigned together."));
+		rebuildGroupButton_->setToolTip(QStringLiteral("Restarts all mapped NDI receivers. This is the broadest and most disruptive recovery action."));
+		captureSnapshot->setToolTip(QStringLiteral("Saves the current DistroAV source settings in memory for this OBS session and records the current sync baseline when available."));
+		restoreSnapshot->setToolTip(QStringLiteral("Restores the settings saved with Save Current Settings, then rebuilds the mapped receivers."));
+		markEventButton->setToolTip(QStringLiteral("Adds a timestamped note to the Sync Guardian event log and, when enabled, the current recording chapter list."));
+		refreshSources->setToolTip(QStringLiteral("Rescans OBS for DistroAV receiver sources after sources are added, removed, or renamed."));
 
 		controlGrid->addWidget(resetVideoButton_, 1, 0);
 		controlGrid->addWidget(resetDesktopButton_, 1, 1);
@@ -588,6 +739,7 @@ private:
 		controlGrid->addWidget(refreshSources, 5, 1);
 
 		pulseDurationMs_ = createSpin(controlBox, 50, 1500, 180, QStringLiteral(" ms reset pulse"));
+		pulseDurationMs_->setToolTip(QStringLiteral("How long Sync Guardian temporarily changes a DistroAV setting to force a receiver rebuild. The default normally should not be changed."));
 		controlGrid->addWidget(pulseDurationMs_, 6, 0, 1, 2);
 		chapterMarkers_ = new QCheckBox(QStringLiteral("Add recording chapter on actions"), controlBox);
 		chapterMarkers_->setChecked(true);
@@ -599,6 +751,13 @@ private:
 		controlGrid->addWidget(jsonLogging_, 8, 0, 1, 2);
 		controlGrid->addWidget(incidentReports_, 9, 0, 1, 2);
 		root->addWidget(controlBox);
+
+		QObject::connect(advancedToggleButton_, &QPushButton::toggled, [this](bool shown) {
+			advancedSettingsWidget_->setVisible(shown);
+			advancedToggleButton_->setText(shown ? QStringLiteral("Hide advanced detection settings")
+						      : QStringLiteral("Show advanced detection settings"));
+			saveConfig();
+		});
 
 		QObject::connect(resetVideoButton_, &QPushButton::clicked,
 				 [this]() { manualReset(RecoveryTarget::Video, QStringLiteral("Reset Video Only")); });
@@ -657,8 +816,10 @@ private:
 		statusTable_->setHorizontalHeaderLabels({QStringLiteral("Role"), QStringLiteral("OBS source"),
 							 QStringLiteral("State"), QStringLiteral("Packet age"),
 							 QStringLiteral("Timestamp jumps"), QStringLiteral("Resets"),
-							 QStringLiteral("Recoveries"), QStringLiteral("DistroAV settings")});
+							 QStringLiteral("Verified recoveries"), QStringLiteral("DistroAV settings")});
 		statusTable_->verticalHeader()->setVisible(false);
+		statusTable_->setToolTip(QStringLiteral(
+			"Packet age shows how long it has been since a timestamp advanced. Timestamp jumps are sudden timing corrections. Verified recoveries only count resets that passed the post-reset health check."));
 		statusTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
 		statusTable_->setSelectionMode(QAbstractItemView::NoSelection);
 		statusTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -725,7 +886,7 @@ private:
 		suggestedTarget_ = RecoveryTarget::None;
 		if (manualSuggestionLabel_) {
 			manualSuggestionLabel_->setStyleSheet(QString());
-			manualSuggestionLabel_->setText(QStringLiteral("Suggested manual action: none — monitoring healthy"));
+			manualSuggestionLabel_->setText(QStringLiteral("Suggested manual action: none — monitoring healthy. Hover over a button for help."));
 		}
 	}
 
@@ -765,9 +926,16 @@ private:
 
 		if (activeSummaryIssue_ != issue) {
 			activeSummaryIssue_ = issue;
-			const size_t index = static_cast<size_t>(issue);
-			if (index < issueEpisodeCounts_.size())
-				issueEpisodeCounts_[index]++;
+			const uint64_t now = os_gettime_ns();
+			const bool mergedRepeat = lastCountedIssue_ == issue && lastCountedIssueNs_ &&
+						 now - lastCountedIssueNs_ < kIssueEpisodeMergeNs;
+			if (!mergedRepeat) {
+				const size_t index = static_cast<size_t>(issue);
+				if (index < issueEpisodeCounts_.size())
+					issueEpisodeCounts_[index]++;
+				lastCountedIssue_ = issue;
+				lastCountedIssueNs_ = now;
+			}
 			lastIssueSummary_ = QStringLiteral("%1; suggested %2")
 					    .arg(issueSummaryName(issue), targetName(target));
 			lastIssueTime_ = QDateTime::currentDateTime();
@@ -784,7 +952,7 @@ private:
 
 	uint64_t totalTimestampJumps() const
 	{
-		return states_[0].videoJumpCount + states_[1].audioJumpCount.load() + states_[2].audioJumpCount.load();
+		return states_[0].videoJumpCount.load() + states_[1].audioJumpCount.load() + states_[2].audioJumpCount.load();
 	}
 
 	uint64_t totalResetPulses() const
@@ -917,6 +1085,16 @@ private:
 			loadCheckIfPresent(config, "chapter_markers", chapterMarkers_);
 			loadCheckIfPresent(config, "json_logging", jsonLogging_);
 			loadCheckIfPresent(config, "incident_reports", incidentReports_);
+			if (obs_data_has_user_value(config, "advanced_settings_visible")) {
+				const bool visible = obs_data_get_bool(config, "advanced_settings_visible");
+				{
+					QSignalBlocker blocker(advancedToggleButton_);
+					advancedToggleButton_->setChecked(visible);
+				}
+				advancedSettingsWidget_->setVisible(visible);
+				advancedToggleButton_->setText(visible ? QStringLiteral("Hide advanced detection settings")
+								 : QStringLiteral("Show advanced detection settings"));
+			}
 			setSpinBlocked(videoStallMs_, obs_data_get_int(config, "video_stall_ms"));
 			setSpinBlocked(audioStallMs_, obs_data_get_int(config, "audio_stall_ms"));
 			setSpinBlocked(driftThresholdMs_, obs_data_get_int(config, "drift_threshold_ms"));
@@ -976,6 +1154,7 @@ private:
 		obs_data_set_bool(data, "chapter_markers", chapterMarkers_->isChecked());
 		obs_data_set_bool(data, "json_logging", jsonLogging_->isChecked());
 		obs_data_set_bool(data, "incident_reports", incidentReports_->isChecked());
+		obs_data_set_bool(data, "advanced_settings_visible", advancedToggleButton_->isChecked());
 		obs_data_set_int(data, "video_stall_ms", videoStallMs_->value());
 		obs_data_set_int(data, "audio_stall_ms", audioStallMs_->value());
 		obs_data_set_int(data, "drift_threshold_ms", driftThresholdMs_->value());
@@ -1007,16 +1186,23 @@ private:
 	void bindSource(size_t index, const QString &name)
 	{
 		SourceState &state = states_[index];
-		if (state.sourceName == name && state.weak)
-			return;
+		// Always rebuild the binding when the source list is rescanned. This also
+		// reattaches the private video timestamp probe if OBS or DistroAV recreated
+		// the mapped receiver source without changing its visible name.
 		detachSource(state);
 		state.sourceName = name;
 		state.wasFresh = false;
 		state.hasEverBeenFresh = false;
 		state.lastAudioTimestampNs.store(0);
 		state.lastAudioWallNs.store(0);
-		state.lastVideoTimestampNs = 0;
-		state.lastVideoWallNs = 0;
+		state.lastAudioJumpWallNs.store(0);
+		state.lastAudioJumpErrorNs.store(0);
+		state.lastVideoTimestampNs.store(0);
+		state.lastVideoWallNs.store(0);
+		state.lastVideoArrivalWallNs.store(0);
+		state.lastVideoJumpWallNs.store(0);
+		state.lastVideoJumpErrorNs.store(0);
+		state.firstValidSampleWallNs.store(0);
 		state.enabled = false;
 		state.active = false;
 		state.showing = false;
@@ -1027,23 +1213,79 @@ private:
 		if (!source)
 			return;
 		state.weak = obs_source_get_weak_source(source);
+		if (index == 0)
+			attachVideoProbe(state, source);
 		if (state.monitorAudio)
 			obs_source_add_audio_capture_callback(source, audioCapture, &state);
 		obs_source_release(source);
 	}
 
+	void attachVideoProbe(SourceState &state, obs_source_t *source)
+	{
+		if (!source)
+			return;
+
+		obs_source_t *existing = obs_source_get_filter_by_name(source, kVideoProbeFilterName);
+		if (existing) {
+			const char *existingId = obs_source_get_unversioned_id(existing);
+			if (existingId && strcmp(existingId, kVideoProbeFilterId) == 0)
+				obs_source_filter_remove(source, existing);
+			obs_source_release(existing);
+		}
+
+		const uint64_t token = g_nextVideoProbeToken.fetch_add(1);
+		{
+			std::lock_guard<std::mutex> lock(g_videoProbeRegistryMutex);
+			g_videoProbeRegistry[token] = &state;
+		}
+		state.videoProbeToken = token;
+
+		obs_data_t *settings = obs_data_create();
+		obs_data_set_int(settings, kVideoProbeTokenKey, static_cast<long long>(token));
+		obs_source_t *probe = obs_source_create_private(kVideoProbeFilterId, kVideoProbeFilterName, settings);
+		obs_data_release(settings);
+		if (!probe) {
+			std::lock_guard<std::mutex> lock(g_videoProbeRegistryMutex);
+			g_videoProbeRegistry.erase(token);
+			state.videoProbeToken = 0;
+			appendEvent(QStringLiteral("Video timestamp probe could not be created; video monitoring is unavailable"), false);
+			return;
+		}
+
+		obs_source_filter_add(source, probe);
+		state.videoProbeWeak = obs_source_get_weak_source(probe);
+		obs_source_release(probe);
+	}
+
 	void detachSource(SourceState &state)
 	{
-		if (!state.weak)
-			return;
-		obs_source_t *source = obs_weak_source_get_source(state.weak);
+		obs_source_t *source = state.weak ? obs_weak_source_get_source(state.weak) : nullptr;
 		if (source) {
+			if (state.videoProbeWeak) {
+				obs_source_t *probe = obs_weak_source_get_source(state.videoProbeWeak);
+				if (probe) {
+					obs_source_filter_remove(source, probe);
+					obs_source_release(probe);
+				}
+			}
 			if (state.monitorAudio)
 				obs_source_remove_audio_capture_callback(source, audioCapture, &state);
 			obs_source_release(source);
 		}
-		obs_weak_source_release(state.weak);
-		state.weak = nullptr;
+
+		if (state.videoProbeWeak) {
+			obs_weak_source_release(state.videoProbeWeak);
+			state.videoProbeWeak = nullptr;
+		}
+		if (state.videoProbeToken) {
+			std::lock_guard<std::mutex> lock(g_videoProbeRegistryMutex);
+			g_videoProbeRegistry.erase(state.videoProbeToken);
+			state.videoProbeToken = 0;
+		}
+		if (state.weak) {
+			obs_weak_source_release(state.weak);
+			state.weak = nullptr;
+		}
 	}
 
 	static void audioCapture(void *param, obs_source_t *, const struct audio_data *audio, bool)
@@ -1053,6 +1295,10 @@ private:
 			return;
 		const uint64_t now = os_gettime_ns();
 		const uint64_t timestamp = audio->timestamp;
+		if (timestamp) {
+			uint64_t expectedFirst = 0;
+			state->firstValidSampleWallNs.compare_exchange_strong(expectedFirst, now);
+		}
 		const uint64_t previousTimestamp = state->lastAudioTimestampNs.exchange(timestamp);
 		const uint64_t previousWall = state->lastAudioWallNs.exchange(now);
 		if (!previousTimestamp || !previousWall || timestamp == 0)
@@ -1081,6 +1327,17 @@ private:
 		if (state.sourceName.isEmpty())
 			return nullptr;
 		return obs_get_source_by_name(state.sourceName.toUtf8().constData());
+	}
+
+	bool videoProbeAttached() const
+	{
+		if (!states_[0].videoProbeWeak)
+			return false;
+		obs_source_t *probe = obs_weak_source_get_source(states_[0].videoProbeWeak);
+		if (!probe)
+			return false;
+		obs_source_release(probe);
+		return true;
 	}
 
 	bool pulseReset(SourceState &state)
@@ -1255,22 +1512,32 @@ private:
 		const double micOffset = calculateMicOffsetMs();
 		const double drift = currentDriftMs();
 
-		if (std::isfinite(filteredOffsetMs_))
+		if (std::isfinite(filteredOffsetMs_)) {
 			avOffsetLabel_->setText(QStringLiteral("Video − Desktop Audio timestamp: %1 ms filtered (%2 ms raw)")
 							.arg(filteredOffsetMs_, 0, 'f', 2)
 							.arg(rawOffset, 0, 'f', 2));
-		else
-			avOffsetLabel_->setText(QStringLiteral("Video − Desktop Audio timestamp: —"));
+		} else if (!states_[0].firstValidSampleWallNs.load()) {
+			avOffsetLabel_->setText(states_[0].lastVideoArrivalWallNs.load()
+						 ? QStringLiteral("Video − Desktop Audio timestamp: video frame seen, waiting for a valid timestamp")
+						 : QStringLiteral("Video − Desktop Audio timestamp: waiting for first video frame"));
+		} else if (!states_[1].firstValidSampleWallNs.load()) {
+			avOffsetLabel_->setText(QStringLiteral("Video − Desktop Audio timestamp: waiting for desktop audio"));
+		} else {
+			avOffsetLabel_->setText(QStringLiteral("Video − Desktop Audio timestamp: collecting stable samples"));
+		}
 
 		if (std::isfinite(drift)) {
 			driftLabel_->setText(QStringLiteral("Drift from baseline: %1 ms | rate %2 ms/min | baseline %3 ms")
-						    .arg(drift, 0, 'f', 2)
-						    .arg(driftRateMsPerMinute_, 0, 'f', 2)
-						    .arg(baselineOffsetMs_, 0, 'f', 2));
-		} else {
+							    .arg(drift, 0, 'f', 2)
+							    .arg(driftRateMsPerMinute_, 0, 'f', 2)
+							    .arg(baselineOffsetMs_, 0, 'f', 2));
+		} else if (states_[0].firstValidSampleWallNs.load() && states_[1].firstValidSampleWallNs.load()) {
 			driftLabel_->setText(QStringLiteral("Drift from baseline: calibrating — %1 seconds of stable data required")
-						    .arg(static_cast<int>(kBaselineWindowNs / kNsPerSecond)));
+							    .arg(static_cast<int>(kBaselineWindowNs / kNsPerSecond)));
+		} else {
+			driftLabel_->setText(QStringLiteral("Drift from baseline: waiting for valid video and desktop-audio timestamps"));
 		}
+
 		micOffsetLabel_->setText(std::isfinite(micOffset)
 						 ? QStringLiteral("Mic − Desktop Audio timestamp: %1 ms").arg(micOffset, 0, 'f', 2)
 						 : QStringLiteral("Mic − Desktop Audio timestamp: —"));
@@ -1292,17 +1559,17 @@ private:
 		bool fresh = false;
 
 		if (source) {
-			if (index == 0)
-				pollVideoFrame(state, source, now);
-
 			state.active = obs_source_active(source);
 			state.showing = obs_source_showing(source);
 			state.enabled = obs_source_enabled(source);
-			stateText = QStringLiteral("%1 / %2 / %3%4")
+			stateText = QStringLiteral("%1 / %2 / %3%4%5")
 					    .arg(state.enabled ? QStringLiteral("Enabled") : QStringLiteral("Disabled"),
 						 state.active ? QStringLiteral("Active") : QStringLiteral("Inactive"),
 						 state.showing ? QStringLiteral("Showing") : QStringLiteral("Hidden"),
-						 state.resetInProgress->load() ? QStringLiteral(" / Resetting") : QString());
+						 state.resetInProgress->load() ? QStringLiteral(" / Resetting") : QString(),
+						 index == 0 ? (videoProbeAttached() ? QStringLiteral(" / Probe ready")
+										      : QStringLiteral(" / Probe missing"))
+							    : QString());
 
 			const uint64_t packetWall = packetWallNs(index);
 			if (packetWall && now >= packetWall) {
@@ -1310,6 +1577,12 @@ private:
 				packetAgeText = QStringLiteral("%1 ms").arg(ageMs, 0, 'f', 1);
 				const int threshold = index == 0 ? videoStallMs_->value() : audioStallMs_->value();
 				fresh = ageMs < static_cast<double>(threshold);
+			} else if (index == 0) {
+				const uint64_t arrival = state.lastVideoArrivalWallNs.load();
+				packetAgeText = arrival ? QStringLiteral("Frame seen; waiting for timestamp")
+							: QStringLiteral("Waiting for first video frame");
+			} else {
+				packetAgeText = QStringLiteral("Waiting for first audio block");
 			}
 
 			obs_data_t *settings = obs_source_get_settings(source);
@@ -1329,13 +1602,11 @@ private:
 			state.enabled = false;
 		}
 
-		if (fresh && !state.wasFresh && state.hasEverBeenFresh)
-			state.recoveryCount++;
 		if (fresh)
 			state.hasEverBeenFresh = true;
 		state.wasFresh = fresh;
 
-		const uint64_t jumps = index == 0 ? state.videoJumpCount : state.audioJumpCount.load();
+		const uint64_t jumps = index == 0 ? state.videoJumpCount.load() : state.audioJumpCount.load();
 		setCell(index, 0, state.role);
 		setCell(index, 1, state.sourceName.isEmpty() ? QStringLiteral("(Not selected)") : state.sourceName);
 		setCell(index, 2, stateText);
@@ -1346,48 +1617,23 @@ private:
 		setCell(index, 7, settingsText);
 	}
 
-	void pollVideoFrame(SourceState &state, obs_source_t *source, uint64_t now)
-	{
-		obs_source_frame *frame = obs_source_get_frame(source);
-		if (!frame)
-			return;
-		const uint64_t timestamp = frame->timestamp;
-		obs_source_release_frame(source, frame);
-		if (!timestamp || timestamp == state.lastVideoTimestampNs)
-			return;
-
-		if (state.lastVideoTimestampNs && state.lastVideoWallNs) {
-			const int64_t timestampDelta = signedDelta(timestamp, state.lastVideoTimestampNs);
-			const int64_t wallDelta = signedDelta(now, state.lastVideoWallNs);
-			const int64_t error = timestampDelta - wallDelta;
-			if (std::llabs(error) >= static_cast<int64_t>(kJumpThresholdNs) &&
-			    (!state.lastVideoJumpWallNs || now - state.lastVideoJumpWallNs >= kJumpCooldownNs)) {
-				state.lastVideoJumpWallNs = now;
-				state.lastVideoJumpErrorNs = error;
-				state.videoJumpCount++;
-			}
-		}
-		state.lastVideoTimestampNs = timestamp;
-		state.lastVideoWallNs = now;
-	}
-
 	uint64_t packetWallNs(size_t index) const
 	{
-		return index == 0 ? states_[0].lastVideoWallNs : states_[index].lastAudioWallNs.load();
+		return index == 0 ? states_[0].lastVideoWallNs.load() : states_[index].lastAudioWallNs.load();
 	}
 
 	double packetAgeMs(size_t index, uint64_t now) const
 	{
 		const uint64_t wall = packetWallNs(index);
 		if (!wall || now < wall)
-			return std::numeric_limits<double>::infinity();
+			return std::numeric_limits<double>::quiet_NaN();
 		return static_cast<double>(now - wall) / static_cast<double>(kNsPerMs);
 	}
 
 	double calculateAvOffsetMs() const
 	{
-		const uint64_t videoTs = states_[0].lastVideoTimestampNs;
-		const uint64_t videoWall = states_[0].lastVideoWallNs;
+		const uint64_t videoTs = states_[0].lastVideoTimestampNs.load();
+		const uint64_t videoWall = states_[0].lastVideoWallNs.load();
 		const uint64_t audioTs = states_[1].lastAudioTimestampNs.load();
 		const uint64_t audioWall = states_[1].lastAudioWallNs.load();
 		if (!videoTs || !videoWall || !audioTs || !audioWall)
@@ -1515,6 +1761,34 @@ private:
 		       states_[1].enabled && states_[1].active;
 	}
 
+	bool requiredStreamsReady(uint64_t now, QString &reason) const
+	{
+		if (!videoProbeAttached()) {
+			reason = QStringLiteral("video timestamp probe is not attached; rescan sources or remap NDI Video");
+			return false;
+		}
+
+		const uint64_t videoFirst = states_[0].firstValidSampleWallNs.load();
+		const uint64_t desktopFirst = states_[1].firstValidSampleWallNs.load();
+		if (!videoFirst) {
+			reason = states_[0].lastVideoArrivalWallNs.load()
+				 ? QStringLiteral("video frames are arriving, but no valid video timestamp has been received yet")
+				 : QStringLiteral("waiting for the first NDI video frame");
+			return false;
+		}
+		if (!desktopFirst) {
+			reason = QStringLiteral("waiting for the first NDI desktop-audio block");
+			return false;
+		}
+
+		const uint64_t firstReady = std::max(videoFirst, desktopFirst);
+		if (now < firstReady || now - firstReady < kFirstSampleGraceNs) {
+			reason = QStringLiteral("initial video/audio timestamps are settling");
+			return false;
+		}
+		return true;
+	}
+
 	void evaluateAutomation(uint64_t now)
 	{
 		if (recovery_.active) {
@@ -1572,12 +1846,26 @@ private:
 			return;
 		}
 
+		QString readinessReason;
+		if (!requiredStreamsReady(now, readinessReason)) {
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("waiting for valid NDI timing data");
+			clearSuggestedRecovery();
+			automationStatusLabel_->setText(QStringLiteral("Automation: %1").arg(readinessReason));
+			resetConditionTimers();
+			currentConfidence_ = 0;
+			healthLabel_->setText(QStringLiteral("Detection confidence: 0/100 | waiting for data"));
+			return;
+		}
+
 		const double videoAge = packetAgeMs(0, now);
 		const double desktopAge = packetAgeMs(1, now);
 		const double micAge = packetAgeMs(2, now);
 		const bool videoFresh = videoAge < videoStallMs_->value();
 		const bool desktopFresh = desktopAge < audioStallMs_->value();
-		const bool micExpected = !states_[2].sourceName.isEmpty() && states_[2].enabled && states_[2].active;
+		const bool micMapped = !states_[2].sourceName.isEmpty() && states_[2].enabled && states_[2].active;
+		const uint64_t micFirst = states_[2].firstValidSampleWallNs.load();
+		const bool micExpected = micMapped && micFirst && now >= micFirst && now - micFirst >= kFirstSampleGraceNs;
 		const bool micStaleIfExpected = !micExpected || micAge >= audioStallMs_->value();
 		const bool bothAudioStalled = enableFreezeDetection_->isChecked() && videoFresh && micExpected &&
 					      desktopAge >= audioStallMs_->value() && micAge >= audioStallMs_->value();
@@ -1702,7 +1990,7 @@ private:
 
 	bool recentJumpEvidence(uint64_t now) const
 	{
-		const uint64_t videoJump = states_[0].lastVideoJumpWallNs;
+		const uint64_t videoJump = states_[0].lastVideoJumpWallNs.load();
 		const uint64_t desktopJump = states_[1].lastAudioJumpWallNs.load();
 		return (videoJump && now - videoJump <= kJumpEvidenceWindowNs) ||
 		       (desktopJump && now - desktopJump <= kJumpEvidenceWindowNs);
@@ -1803,10 +2091,36 @@ private:
 				    .arg(targetName(target), reason));
 	}
 
+	void incrementVerifiedSourceRecoveries(RecoveryTarget target)
+	{
+		switch (target) {
+		case RecoveryTarget::Video:
+			states_[0].recoveryCount++;
+			break;
+		case RecoveryTarget::DesktopAudio:
+			states_[1].recoveryCount++;
+			break;
+		case RecoveryTarget::Mic:
+			states_[2].recoveryCount++;
+			break;
+		case RecoveryTarget::BothAudio:
+			states_[1].recoveryCount++;
+			states_[2].recoveryCount++;
+			break;
+		case RecoveryTarget::EntireGroup:
+			for (auto &state : states_)
+				state.recoveryCount++;
+			break;
+		default:
+			break;
+		}
+	}
+
 	void verifyRecovery(uint64_t now)
 	{
 		const bool recovered = recoverySucceeded(now);
 		if (recovered) {
+			incrementVerifiedSourceRecoveries(recovery_.target);
 			verifiedRecoveryCount_++;
 			appendEvent(QStringLiteral("Recovery verified: %1 is fresh and the triggering condition cleared")
 					    .arg(targetName(recovery_.target)));
@@ -1984,10 +2298,10 @@ private:
 	void logNewTimestampJumps()
 	{
 		for (size_t index = 0; index < states_.size(); ++index) {
-			const uint64_t count = index == 0 ? states_[index].videoJumpCount : states_[index].audioJumpCount.load();
+			const uint64_t count = index == 0 ? states_[index].videoJumpCount.load() : states_[index].audioJumpCount.load();
 			if (count <= loggedJumpCounts_[index])
 				continue;
-			const int64_t errorNs = index == 0 ? states_[index].lastVideoJumpErrorNs
+			const int64_t errorNs = index == 0 ? states_[index].lastVideoJumpErrorNs.load()
 						       : states_[index].lastAudioJumpErrorNs.load();
 			const uint64_t newEvents = count - loggedJumpCounts_[index];
 			loggedJumpCounts_[index] = count;
@@ -2126,6 +2440,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[sync-guardian] Loading version %s", PLUGIN_VERSION);
+	registerVideoProbeFilter();
 	return true;
 }
 
@@ -2138,5 +2453,9 @@ void obs_module_unload(void)
 {
 	delete g_guardian;
 	g_guardian = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(g_videoProbeRegistryMutex);
+		g_videoProbeRegistry.clear();
+	}
 	blog(LOG_INFO, "[sync-guardian] Unloaded");
 }

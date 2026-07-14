@@ -1,0 +1,63 @@
+name: Build Sync Guardian for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out Sync Guardian
+        uses: actions/checkout@v4
+
+      - name: Download official OBS plugin build infrastructure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/obsproject/obs-plugintemplate/archive/refs/heads/master.zip' `
+            -OutFile "$env:RUNNER_TEMP\obs-plugintemplate.zip"
+          Expand-Archive `
+            -Path "$env:RUNNER_TEMP\obs-plugintemplate.zip" `
+            -DestinationPath "$env:RUNNER_TEMP\obs-plugintemplate"
+          $template = Join-Path $env:RUNNER_TEMP 'obs-plugintemplate\obs-plugintemplate-master'
+          Copy-Item -Recurse -Force "$template\build-aux" "$env:GITHUB_WORKSPACE\build-aux"
+          Copy-Item -Recurse -Force "$template\cmake" "$env:GITHUB_WORKSPACE\cmake"
+          Copy-Item -Force "$template\CMakePresets.json" "$env:GITHUB_WORKSPACE\CMakePresets.json"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\.github\scripts" | Out-Null
+          Copy-Item -Recurse -Force "$template\.github\scripts\*" "$env:GITHUB_WORKSPACE\.github\scripts"
+
+      - name: Build Windows x64 DLL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+
+      - name: Package Windows plugin ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+
+      - name: Show produced files
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse release | Select-Object FullName, Length
+
+      - name: Upload compiled plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-guardian-0.2.0-windows-x64
+          path: |
+            release/*windows-x64*.zip
+            release/*windows-x64*.exe
+          if-no-files-found: error
+          retention-days: 30

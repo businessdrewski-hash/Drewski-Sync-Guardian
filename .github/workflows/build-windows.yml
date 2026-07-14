@@ -93,7 +93,7 @@ jobs:
       - name: Upload install-ready plugin
         uses: actions/upload-artifact@v4
         with:
-          name: sync-guardian-0.2.3-windows-x64
+          name: sync-guardian-0.2.4-windows-x64
           path: obs-install/
           if-no-files-found: error
           retention-days: 30

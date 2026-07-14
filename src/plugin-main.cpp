@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Sync Guardian v0.2.0 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
+// Sync Guardian v0.2.3 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -12,6 +12,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFont>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
@@ -23,6 +24,7 @@
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStringList>
@@ -49,7 +51,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("sync-guardian", "en-US")
 
 #ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "0.2.0"
+#define PLUGIN_VERSION "0.2.3"
 #endif
 
 namespace {
@@ -143,6 +145,8 @@ enum class RecoveryTarget : int {
 
 enum class IssueKind : int {
 	None = 0,
+	EntireGroupStall,
+	BothAudioStall,
 	VideoStall,
 	DesktopAudioStall,
 	MicStall,
@@ -176,6 +180,26 @@ static QString modeName(AutomationMode mode)
 		return QStringLiteral("Fully automatic");
 	default:
 		return QStringLiteral("Observe only");
+	}
+}
+
+static QString issueSummaryName(IssueKind issue)
+{
+	switch (issue) {
+	case IssueKind::EntireGroupStall:
+		return QStringLiteral("all mapped NDI streams stalled");
+	case IssueKind::BothAudioStall:
+		return QStringLiteral("both NDI audio streams stalled");
+	case IssueKind::VideoStall:
+		return QStringLiteral("NDI video stalled");
+	case IssueKind::DesktopAudioStall:
+		return QStringLiteral("NDI desktop audio stalled");
+	case IssueKind::MicStall:
+		return QStringLiteral("NDI microphone stalled");
+	case IssueKind::PersistentDrift:
+		return QStringLiteral("persistent A/V timestamp drift detected");
+	default:
+		return QStringLiteral("no active sync issue");
 	}
 }
 
@@ -353,8 +377,15 @@ private:
 	QSpinBox *maxAutoResetsPerHour_ = nullptr;
 	QSpinBox *startupGraceSec_ = nullptr;
 	QSpinBox *verifyDelaySec_ = nullptr;
+	QPushButton *resetVideoButton_ = nullptr;
+	QPushButton *resetDesktopButton_ = nullptr;
+	QPushButton *resetMicButton_ = nullptr;
+	QPushButton *resetBothAudioButton_ = nullptr;
+	QPushButton *rebuildGroupButton_ = nullptr;
+	QLabel *manualSuggestionLabel_ = nullptr;
 
 	QLabel *automationStatusLabel_ = nullptr;
+	QLabel *overallSummaryLabel_ = nullptr;
 	QLabel *healthLabel_ = nullptr;
 	QLabel *avOffsetLabel_ = nullptr;
 	QLabel *driftLabel_ = nullptr;
@@ -385,12 +416,22 @@ private:
 	uint64_t videoStallSinceNs_ = 0;
 	uint64_t desktopStallSinceNs_ = 0;
 	uint64_t micStallSinceNs_ = 0;
+	uint64_t bothAudioStallSinceNs_ = 0;
+	uint64_t entireGroupStallSinceNs_ = 0;
 	uint64_t driftSinceNs_ = 0;
 	uint64_t lastObservedIssueNs_ = 0;
 	uint64_t lastIncidentStartNs_ = 0;
 	QString lastObservedIssueKey_;
+	RecoveryTarget suggestedTarget_ = RecoveryTarget::None;
 	int currentConfidence_ = 0;
 	std::array<uint64_t, 3> loggedJumpCounts_{0, 0, 0};
+	std::array<uint64_t, 7> issueEpisodeCounts_{0, 0, 0, 0, 0, 0, 0};
+	IssueKind activeSummaryIssue_ = IssueKind::None;
+	QString currentSummaryState_ = QStringLiteral("Starting");
+	QString lastIssueSummary_;
+	QDateTime lastIssueTime_;
+	uint64_t verifiedRecoveryCount_ = 0;
+	uint64_t failedRecoveryCount_ = 0;
 
 	std::array<obs_hotkey_id, 8> hotkeys_{OBS_INVALID_HOTKEY_ID, OBS_INVALID_HOTKEY_ID,
 					      OBS_INVALID_HOTKEY_ID, OBS_INVALID_HOTKEY_ID,
@@ -401,11 +442,41 @@ private:
 	{
 		panel_ = new QWidget();
 		panel_->setObjectName(QStringLiteral("SyncGuardianPanel"));
-		auto *root = new QVBoxLayout(panel_);
-		root->setContentsMargins(8, 8, 8, 8);
+		QFont compactFont = panel_->font();
+		if (compactFont.pointSizeF() > 8.0)
+			compactFont.setPointSizeF(std::max(8.0, compactFont.pointSizeF() - 0.75));
+		panel_->setFont(compactFont);
+		panel_->setStyleSheet(QStringLiteral(
+			"#SyncGuardianPanel QGroupBox { margin-top: 7px; }"
+			"#SyncGuardianPanel QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 2px; }"
+			"#SyncGuardianPanel QPushButton { padding: 2px 5px; min-height: 20px; }"
+			"#SyncGuardianPanel QComboBox, #SyncGuardianPanel QSpinBox { min-height: 20px; }"));
 
-		auto *sourceBox = new QGroupBox(QStringLiteral("NDI source mapping"), panel_);
+		// Keep the OBS dock compact on lower-resolution displays. The outer widget
+		// always fits the available dock area while the full control surface scrolls.
+		auto *outerLayout = new QVBoxLayout(panel_);
+		outerLayout->setContentsMargins(0, 0, 0, 0);
+		outerLayout->setSpacing(0);
+
+		auto *scrollArea = new QScrollArea(panel_);
+		scrollArea->setObjectName(QStringLiteral("SyncGuardianScrollArea"));
+		scrollArea->setWidgetResizable(true);
+		scrollArea->setFrameShape(QFrame::NoFrame);
+		scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+		scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+		auto *scrollContent = new QWidget(scrollArea);
+		scrollContent->setObjectName(QStringLiteral("SyncGuardianScrollContent"));
+		auto *root = new QVBoxLayout(scrollContent);
+		root->setContentsMargins(5, 5, 5, 5);
+		root->setSpacing(5);
+		root->setSizeConstraint(QLayout::SetMinAndMaxSize);
+
+		auto *sourceBox = new QGroupBox(QStringLiteral("NDI source mapping"), scrollContent);
 		auto *sourceForm = new QFormLayout(sourceBox);
+		sourceForm->setContentsMargins(6, 5, 6, 6);
+		sourceForm->setHorizontalSpacing(6);
+		sourceForm->setVerticalSpacing(3);
 		for (size_t i = 0; i < sourceCombos_.size(); ++i) {
 			sourceCombos_[i] = new QComboBox(sourceBox);
 			sourceCombos_[i]->setSizeAdjustPolicy(QComboBox::AdjustToContents);
@@ -419,29 +490,38 @@ private:
 		}
 		root->addWidget(sourceBox);
 
-		auto *automationBox = new QGroupBox(QStringLiteral("Automatic detection and recovery"), panel_);
+		auto *automationBox = new QGroupBox(QStringLiteral("Automatic detection and recovery"), scrollContent);
 		auto *automationForm = new QFormLayout(automationBox);
+		automationForm->setContentsMargins(6, 5, 6, 6);
+		automationForm->setHorizontalSpacing(6);
+		automationForm->setVerticalSpacing(3);
 		automationMode_ = new QComboBox(automationBox);
 		automationMode_->addItem(QStringLiteral("Observe only"), static_cast<int>(AutomationMode::Observe));
 		automationMode_->addItem(QStringLiteral("Ask before resetting"), static_cast<int>(AutomationMode::Ask));
 		automationMode_->addItem(QStringLiteral("Fully automatic"), static_cast<int>(AutomationMode::Automatic));
 		automationForm->addRow(QStringLiteral("Operating mode:"), automationMode_);
 
-		onlyWhenOutputActive_ = new QCheckBox(QStringLiteral("Only act while streaming or recording"), automationBox);
+		onlyWhenOutputActive_ = new QCheckBox(QStringLiteral("Only act while output is active"), automationBox);
 		onlyWhenOutputActive_->setChecked(true);
-		requireActiveSources_ = new QCheckBox(QStringLiteral("Require mapped sources to be active (video also showing)"), automationBox);
+		requireActiveSources_ = new QCheckBox(QStringLiteral("Require active/showing sources"), automationBox);
 		requireActiveSources_->setChecked(true);
-		enableFreezeDetection_ = new QCheckBox(QStringLiteral("Detect packet stalls and frozen video"), automationBox);
+		enableFreezeDetection_ = new QCheckBox(QStringLiteral("Detect stalls/frozen video"), automationBox);
 		enableFreezeDetection_->setChecked(true);
-		enableDriftDetection_ = new QCheckBox(QStringLiteral("Detect persistent A/V drift from calibrated baseline"), automationBox);
+		enableDriftDetection_ = new QCheckBox(QStringLiteral("Detect persistent A/V drift"), automationBox);
 		enableDriftDetection_->setChecked(true);
-		autoEscalate_ = new QCheckBox(QStringLiteral("Escalate a failed source reset to a full-group rebuild"), automationBox);
+		autoEscalate_ = new QCheckBox(QStringLiteral("Escalate failed reset to full-group rebuild"), automationBox);
 		autoEscalate_->setChecked(true);
-		automationForm->addRow(onlyWhenOutputActive_);
-		automationForm->addRow(requireActiveSources_);
-		automationForm->addRow(enableFreezeDetection_);
-		automationForm->addRow(enableDriftDetection_);
-		automationForm->addRow(autoEscalate_);
+		auto *automationChecks = new QWidget(automationBox);
+		auto *automationChecksGrid = new QGridLayout(automationChecks);
+		automationChecksGrid->setContentsMargins(0, 0, 0, 0);
+		automationChecksGrid->setHorizontalSpacing(8);
+		automationChecksGrid->setVerticalSpacing(1);
+		automationChecksGrid->addWidget(onlyWhenOutputActive_, 0, 0);
+		automationChecksGrid->addWidget(requireActiveSources_, 0, 1);
+		automationChecksGrid->addWidget(enableFreezeDetection_, 1, 0);
+		automationChecksGrid->addWidget(enableDriftDetection_, 1, 1);
+		automationChecksGrid->addWidget(autoEscalate_, 2, 0, 1, 2);
+		automationForm->addRow(automationChecks);
 
 		videoStallMs_ = createSpin(automationBox, 250, 10000, 1000, QStringLiteral(" ms"));
 		audioStallMs_ = createSpin(automationBox, 250, 10000, 1000, QStringLiteral(" ms"));
@@ -451,6 +531,12 @@ private:
 		maxAutoResetsPerHour_ = createSpin(automationBox, 1, 20, 3, QStringLiteral(" / hour"));
 		startupGraceSec_ = createSpin(automationBox, 5, 300, 30, QStringLiteral(" sec"));
 		verifyDelaySec_ = createSpin(automationBox, 2, 30, 5, QStringLiteral(" sec"));
+		videoStallMs_->setToolTip(QStringLiteral("Default 1000 ms plus a fixed 500 ms confirmation window before action."));
+		audioStallMs_->setToolTip(QStringLiteral("Default 1000 ms plus a fixed 500 ms confirmation window before action."));
+		driftThresholdMs_->setToolTip(QStringLiteral("A single timestamp jump does not trigger recovery; the filtered offset must remain beyond this value."));
+		driftPersistenceMs_->setToolTip(QStringLiteral("How long a filtered A/V offset must remain beyond the threshold before recovery is suggested."));
+		cooldownSec_->setToolTip(QStringLiteral("Minimum delay between automatic recovery attempts."));
+		maxAutoResetsPerHour_->setToolTip(QStringLiteral("Hard safety cap across targeted resets and full-group escalations."));
 		automationForm->addRow(QStringLiteral("Video stall threshold:"), videoStallMs_);
 		automationForm->addRow(QStringLiteral("Audio stall threshold:"), audioStallMs_);
 		automationForm->addRow(QStringLiteral("Persistent drift threshold:"), driftThresholdMs_);
@@ -463,6 +549,7 @@ private:
 		auto *calibrationButtons = new QWidget(automationBox);
 		auto *calibrationLayout = new QGridLayout(calibrationButtons);
 		calibrationLayout->setContentsMargins(0, 0, 0, 0);
+		calibrationLayout->setHorizontalSpacing(4);
 		auto *setBaseline = new QPushButton(QStringLiteral("Set Current Baseline"), calibrationButtons);
 		auto *autoCalibrate = new QPushButton(QStringLiteral("Restart Auto Calibration"), calibrationButtons);
 		calibrationLayout->addWidget(setBaseline, 0, 0);
@@ -470,50 +557,58 @@ private:
 		automationForm->addRow(QStringLiteral("Calibration:"), calibrationButtons);
 		root->addWidget(automationBox);
 
-		auto *controlBox = new QGroupBox(QStringLiteral("Manual recovery"), panel_);
+		auto *controlBox = new QGroupBox(QStringLiteral("Manual recovery"), scrollContent);
 		auto *controlGrid = new QGridLayout(controlBox);
-		auto *resetVideo = new QPushButton(QStringLiteral("Reset Video Only"), controlBox);
-		auto *resetDesktop = new QPushButton(QStringLiteral("Reset Desktop Audio Only"), controlBox);
-		auto *resetMic = new QPushButton(QStringLiteral("Reset Mic Only"), controlBox);
-		auto *resetBothAudio = new QPushButton(QStringLiteral("Reset Both Audio Sources"), controlBox);
-		auto *rebuildGroup = new QPushButton(QStringLiteral("Rebuild Entire Sync Group"), controlBox);
+		controlGrid->setContentsMargins(6, 5, 6, 6);
+		controlGrid->setHorizontalSpacing(4);
+		controlGrid->setVerticalSpacing(3);
+		manualSuggestionLabel_ = new QLabel(QStringLiteral("Suggested manual action: none — monitoring healthy"), controlBox);
+		manualSuggestionLabel_->setWordWrap(true);
+		manualSuggestionLabel_->setObjectName(QStringLiteral("SyncGuardianManualSuggestion"));
+		controlGrid->addWidget(manualSuggestionLabel_, 0, 0, 1, 2);
+
+		resetVideoButton_ = new QPushButton(QStringLiteral("Reset Video Only"), controlBox);
+		resetDesktopButton_ = new QPushButton(QStringLiteral("Reset Desktop Audio Only"), controlBox);
+		resetMicButton_ = new QPushButton(QStringLiteral("Reset Mic Only"), controlBox);
+		resetBothAudioButton_ = new QPushButton(QStringLiteral("Reset Both Audio Sources"), controlBox);
+		rebuildGroupButton_ = new QPushButton(QStringLiteral("Rebuild Entire Sync Group"), controlBox);
 		auto *captureSnapshot = new QPushButton(QStringLiteral("Capture Known-Good State"), controlBox);
 		auto *restoreSnapshot = new QPushButton(QStringLiteral("Restore Last Known-Good State"), controlBox);
 		auto *markEventButton = new QPushButton(QStringLiteral("Mark Sync Event"), controlBox);
 		auto *refreshSources = new QPushButton(QStringLiteral("Refresh Source List"), controlBox);
 
-		controlGrid->addWidget(resetVideo, 0, 0);
-		controlGrid->addWidget(resetDesktop, 0, 1);
-		controlGrid->addWidget(resetMic, 1, 0);
-		controlGrid->addWidget(resetBothAudio, 1, 1);
-		controlGrid->addWidget(rebuildGroup, 2, 0, 1, 2);
-		controlGrid->addWidget(captureSnapshot, 3, 0);
-		controlGrid->addWidget(restoreSnapshot, 3, 1);
-		controlGrid->addWidget(markEventButton, 4, 0);
-		controlGrid->addWidget(refreshSources, 4, 1);
+		controlGrid->addWidget(resetVideoButton_, 1, 0);
+		controlGrid->addWidget(resetDesktopButton_, 1, 1);
+		controlGrid->addWidget(resetMicButton_, 2, 0);
+		controlGrid->addWidget(resetBothAudioButton_, 2, 1);
+		controlGrid->addWidget(rebuildGroupButton_, 3, 0, 1, 2);
+		controlGrid->addWidget(captureSnapshot, 4, 0);
+		controlGrid->addWidget(restoreSnapshot, 4, 1);
+		controlGrid->addWidget(markEventButton, 5, 0);
+		controlGrid->addWidget(refreshSources, 5, 1);
 
 		pulseDurationMs_ = createSpin(controlBox, 50, 1500, 180, QStringLiteral(" ms reset pulse"));
-		controlGrid->addWidget(pulseDurationMs_, 5, 0, 1, 2);
+		controlGrid->addWidget(pulseDurationMs_, 6, 0, 1, 2);
 		chapterMarkers_ = new QCheckBox(QStringLiteral("Add recording chapter on actions"), controlBox);
 		chapterMarkers_->setChecked(true);
 		jsonLogging_ = new QCheckBox(QStringLiteral("Append events to sync-guardian-events.jsonl"), controlBox);
 		jsonLogging_->setChecked(true);
 		incidentReports_ = new QCheckBox(QStringLiteral("Capture 30 seconds before/after detected incidents"), controlBox);
 		incidentReports_->setChecked(true);
-		controlGrid->addWidget(chapterMarkers_, 6, 0, 1, 2);
-		controlGrid->addWidget(jsonLogging_, 7, 0, 1, 2);
-		controlGrid->addWidget(incidentReports_, 8, 0, 1, 2);
+		controlGrid->addWidget(chapterMarkers_, 7, 0, 1, 2);
+		controlGrid->addWidget(jsonLogging_, 8, 0, 1, 2);
+		controlGrid->addWidget(incidentReports_, 9, 0, 1, 2);
 		root->addWidget(controlBox);
 
-		QObject::connect(resetVideo, &QPushButton::clicked,
+		QObject::connect(resetVideoButton_, &QPushButton::clicked,
 				 [this]() { manualReset(RecoveryTarget::Video, QStringLiteral("Reset Video Only")); });
-		QObject::connect(resetDesktop, &QPushButton::clicked,
+		QObject::connect(resetDesktopButton_, &QPushButton::clicked,
 				 [this]() { manualReset(RecoveryTarget::DesktopAudio, QStringLiteral("Reset Desktop Audio Only")); });
-		QObject::connect(resetMic, &QPushButton::clicked,
+		QObject::connect(resetMicButton_, &QPushButton::clicked,
 				 [this]() { manualReset(RecoveryTarget::Mic, QStringLiteral("Reset Mic Only")); });
-		QObject::connect(resetBothAudio, &QPushButton::clicked,
+		QObject::connect(resetBothAudioButton_, &QPushButton::clicked,
 				 [this]() { manualReset(RecoveryTarget::BothAudio, QStringLiteral("Reset Both Audio Sources")); });
-		QObject::connect(rebuildGroup, &QPushButton::clicked,
+		QObject::connect(rebuildGroupButton_, &QPushButton::clicked,
 				 [this]() { manualReset(RecoveryTarget::EntireGroup, QStringLiteral("Rebuild Entire Sync Group")); });
 		QObject::connect(captureSnapshot, &QPushButton::clicked, [this]() { captureSnapshotState(); });
 		QObject::connect(restoreSnapshot, &QPushButton::clicked, [this]() { restoreSnapshotState(); });
@@ -537,14 +632,20 @@ private:
 			appendEvent(QStringLiteral("NDI source list refreshed"), false);
 		});
 
-		auto *diagnosticsBox = new QGroupBox(QStringLiteral("Live diagnostics"), panel_);
+		auto *diagnosticsBox = new QGroupBox(QStringLiteral("Live diagnostics"), scrollContent);
 		auto *diagnosticsLayout = new QVBoxLayout(diagnosticsBox);
+		diagnosticsLayout->setContentsMargins(6, 5, 6, 6);
+		diagnosticsLayout->setSpacing(2);
+		overallSummaryLabel_ = new QLabel(QStringLiteral("Summary: starting monitoring"), diagnosticsBox);
+		overallSummaryLabel_->setWordWrap(true);
+		overallSummaryLabel_->setStyleSheet(QStringLiteral("font-weight: 600;"));
 		automationStatusLabel_ = new QLabel(QStringLiteral("Automation: starting"), diagnosticsBox);
 		healthLabel_ = new QLabel(QStringLiteral("Detection confidence: 0/100"), diagnosticsBox);
 		avOffsetLabel_ = new QLabel(QStringLiteral("Video − Desktop Audio timestamp: —"), diagnosticsBox);
 		driftLabel_ = new QLabel(QStringLiteral("Drift from baseline: —"), diagnosticsBox);
 		micOffsetLabel_ = new QLabel(QStringLiteral("Mic − Desktop Audio timestamp: —"), diagnosticsBox);
 		obsStatsLabel_ = new QLabel(QStringLiteral("OBS: —"), diagnosticsBox);
+		diagnosticsLayout->addWidget(overallSummaryLabel_);
 		diagnosticsLayout->addWidget(automationStatusLabel_);
 		diagnosticsLayout->addWidget(healthLabel_);
 		diagnosticsLayout->addWidget(avOffsetLabel_);
@@ -562,6 +663,9 @@ private:
 		statusTable_->setSelectionMode(QAbstractItemView::NoSelection);
 		statusTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
 		statusTable_->horizontalHeader()->setStretchLastSection(true);
+		statusTable_->verticalHeader()->setDefaultSectionSize(21);
+		statusTable_->horizontalHeader()->setMinimumHeight(22);
+		statusTable_->setMaximumHeight(112);
 		for (int row = 0; row < 3; ++row) {
 			for (int col = 0; col < 8; ++col)
 				statusTable_->setItem(row, col, new QTableWidgetItem());
@@ -569,10 +673,14 @@ private:
 		diagnosticsLayout->addWidget(statusTable_);
 		root->addWidget(diagnosticsBox);
 
-		eventLog_ = new QTextEdit(panel_);
+		eventLog_ = new QTextEdit(scrollContent);
 		eventLog_->setReadOnly(true);
-		eventLog_->setMaximumHeight(175);
+		eventLog_->setMinimumHeight(72);
+		eventLog_->setMaximumHeight(110);
 		root->addWidget(eventLog_);
+
+		scrollArea->setWidget(scrollContent);
+		outerLayout->addWidget(scrollArea);
 
 		connectSettingsSignals();
 		if (!obs_frontend_add_dock_by_id(kDockId, "Sync Guardian", panel_))
@@ -586,6 +694,139 @@ private:
 		spin->setValue(value);
 		spin->setSuffix(suffix);
 		return spin;
+	}
+
+	QPushButton *buttonForTarget(RecoveryTarget target) const
+	{
+		switch (target) {
+		case RecoveryTarget::Video:
+			return resetVideoButton_;
+		case RecoveryTarget::DesktopAudio:
+			return resetDesktopButton_;
+		case RecoveryTarget::Mic:
+			return resetMicButton_;
+		case RecoveryTarget::BothAudio:
+			return resetBothAudioButton_;
+		case RecoveryTarget::EntireGroup:
+			return rebuildGroupButton_;
+		default:
+			return nullptr;
+		}
+	}
+
+	void clearSuggestedRecovery()
+	{
+		const std::array<QPushButton *, 5> buttons = {resetVideoButton_, resetDesktopButton_, resetMicButton_,
+							       resetBothAudioButton_, rebuildGroupButton_};
+		for (QPushButton *button : buttons) {
+			if (button)
+				button->setStyleSheet(QString());
+		}
+		suggestedTarget_ = RecoveryTarget::None;
+		if (manualSuggestionLabel_) {
+			manualSuggestionLabel_->setStyleSheet(QString());
+			manualSuggestionLabel_->setText(QStringLiteral("Suggested manual action: none — monitoring healthy"));
+		}
+	}
+
+	void showSuggestedRecovery(RecoveryTarget target, const QString &reason, int confidence)
+	{
+		const std::array<QPushButton *, 5> buttons = {resetVideoButton_, resetDesktopButton_, resetMicButton_,
+							       resetBothAudioButton_, rebuildGroupButton_};
+		for (QPushButton *button : buttons) {
+			if (button)
+				button->setStyleSheet(QString());
+		}
+
+		suggestedTarget_ = target;
+		QPushButton *suggested = buttonForTarget(target);
+		if (suggested) {
+			suggested->setStyleSheet(QStringLiteral(
+				"QPushButton { background-color: #2e7d32; color: white; font-weight: 600; border: 1px solid #66bb6a; }"
+				"QPushButton:hover { background-color: #388e3c; }"
+				"QPushButton:pressed { background-color: #1b5e20; }"));
+		}
+		if (manualSuggestionLabel_) {
+			manualSuggestionLabel_->setStyleSheet(QStringLiteral("font-weight: 600;"));
+			manualSuggestionLabel_->setText(
+				QStringLiteral("Suggested manual action: %1%2\n%3")
+					.arg(suggested ? suggested->text() : targetName(target))
+					.arg(confidence > 0 ? QStringLiteral(" (%1/100 confidence)").arg(confidence) : QString())
+					.arg(reason));
+		}
+	}
+
+	void setSummaryIssue(IssueKind issue, RecoveryTarget target)
+	{
+		if (issue == IssueKind::None) {
+			activeSummaryIssue_ = IssueKind::None;
+			return;
+		}
+
+		if (activeSummaryIssue_ != issue) {
+			activeSummaryIssue_ = issue;
+			const size_t index = static_cast<size_t>(issue);
+			if (index < issueEpisodeCounts_.size())
+				issueEpisodeCounts_[index]++;
+			lastIssueSummary_ = QStringLiteral("%1; suggested %2")
+					    .arg(issueSummaryName(issue), targetName(target));
+			lastIssueTime_ = QDateTime::currentDateTime();
+		}
+	}
+
+	uint64_t totalIssueEpisodes() const
+	{
+		uint64_t total = 0;
+		for (size_t i = 1; i < issueEpisodeCounts_.size(); ++i)
+			total += issueEpisodeCounts_[i];
+		return total;
+	}
+
+	uint64_t totalTimestampJumps() const
+	{
+		return states_[0].videoJumpCount + states_[1].audioJumpCount.load() + states_[2].audioJumpCount.load();
+	}
+
+	uint64_t totalResetPulses() const
+	{
+		return states_[0].resetCount + states_[1].resetCount + states_[2].resetCount;
+	}
+
+	void updateOverallSummary()
+	{
+		if (!overallSummaryLabel_)
+			return;
+
+		const uint64_t issues = totalIssueEpisodes();
+		const uint64_t jumps = totalTimestampJumps();
+		const uint64_t resets = totalResetPulses();
+		QString history;
+		if (issues == 0 && jumps == 0 && resets == 0 && verifiedRecoveryCount_ == 0 && failedRecoveryCount_ == 0) {
+			history = QStringLiteral("no sync events this session");
+		} else {
+			history = QStringLiteral("session: %1 issue%2, %3 jump%4, %5 reset%6, %7 recover%8")
+					  .arg(static_cast<unsigned long long>(issues))
+					  .arg(issues == 1 ? QString() : QStringLiteral("s"))
+					  .arg(static_cast<unsigned long long>(jumps))
+					  .arg(jumps == 1 ? QString() : QStringLiteral("s"))
+					  .arg(static_cast<unsigned long long>(resets))
+					  .arg(resets == 1 ? QString() : QStringLiteral("s"))
+					  .arg(static_cast<unsigned long long>(verifiedRecoveryCount_))
+					  .arg(verifiedRecoveryCount_ == 1 ? QStringLiteral("y") : QStringLiteral("ies"));
+			if (failedRecoveryCount_ > 0)
+				history = QStringLiteral("%1, %2 failed verification%3")
+						  .arg(history)
+						  .arg(static_cast<unsigned long long>(failedRecoveryCount_))
+						  .arg(failedRecoveryCount_ == 1 ? QString() : QStringLiteral("s"));
+		}
+
+		QString text = QStringLiteral("Summary: %1; %2").arg(currentSummaryState_, history);
+		if (activeSummaryIssue_ == IssueKind::None && !lastIssueSummary_.isEmpty())
+			text = QStringLiteral("%1. Last: %2 at %3")
+				       .arg(text)
+				       .arg(lastIssueSummary_)
+				       .arg(lastIssueTime_.toString(QStringLiteral("h:mm:ss AP")));
+		overallSummaryLabel_->setText(text);
 	}
 
 	void connectSettingsSignals()
@@ -919,6 +1160,8 @@ private:
 		}
 		const uint64_t now = os_gettime_ns();
 		detectionSuppressedUntilNs_ = now + static_cast<uint64_t>(verifyDelaySec_->value()) * kNsPerSecond;
+		showSuggestedRecovery(target, QStringLiteral("Manual reset pulse started; wait for the streams to settle."),
+				      currentConfidence_);
 		appendEvent(action);
 	}
 
@@ -1034,6 +1277,7 @@ private:
 
 		updateObsStats();
 		evaluateAutomation(now);
+		updateOverallSummary();
 		addDiagnosticSample(now, rawOffset);
 		updateIncidentCapture(now);
 	}
@@ -1274,6 +1518,10 @@ private:
 	void evaluateAutomation(uint64_t now)
 	{
 		if (recovery_.active) {
+			currentSummaryState_ = QStringLiteral("recovery in progress for %1").arg(targetName(recovery_.target));
+			showSuggestedRecovery(recovery_.target,
+					      QStringLiteral("Recovery is in progress; wait for verification before pressing another reset."),
+					      currentConfidence_);
 			if (now >= recovery_.verifyAtNs)
 				verifyRecovery(now);
 			else
@@ -1283,10 +1531,14 @@ private:
 		}
 
 		if (anyResetInProgress()) {
+			currentSummaryState_ = QStringLiteral("manual or automatic reset pulse active");
 			automationStatusLabel_->setText(QStringLiteral("Automation: reset pulse active"));
 			return;
 		}
 		if (now < monitoringGraceUntilNs_) {
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("calibrating and waiting for stable timing data");
+			clearSuggestedRecovery();
 			automationStatusLabel_->setText(QStringLiteral("Automation: startup/calibration grace (%1 sec remaining)")
 							.arg(static_cast<unsigned long long>((monitoringGraceUntilNs_ - now) / kNsPerSecond)));
 			currentConfidence_ = 0;
@@ -1294,11 +1546,15 @@ private:
 			return;
 		}
 		if (now < detectionSuppressedUntilNs_) {
+			currentSummaryState_ = QStringLiteral("monitoring temporarily suppressed after an action");
 			automationStatusLabel_->setText(QStringLiteral("Automation: temporarily suppressed (%1 sec remaining)")
 							.arg(static_cast<unsigned long long>((detectionSuppressedUntilNs_ - now) / kNsPerSecond)));
 			return;
 		}
 		if (onlyWhenOutputActive_->isChecked() && !outputActive()) {
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("waiting for streaming or recording to start");
+			clearSuggestedRecovery();
 			automationStatusLabel_->setText(QStringLiteral("Automation: waiting for streaming or recording"));
 			resetConditionTimers();
 			currentConfidence_ = 0;
@@ -1306,6 +1562,9 @@ private:
 			return;
 		}
 		if (!sourceEligibilitySatisfied()) {
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("waiting for mapped NDI sources to become active");
+			clearSuggestedRecovery();
 			automationStatusLabel_->setText(QStringLiteral("Automation: waiting for mapped sources to become active/showing"));
 			resetConditionTimers();
 			currentConfidence_ = 0;
@@ -1319,6 +1578,11 @@ private:
 		const bool videoFresh = videoAge < videoStallMs_->value();
 		const bool desktopFresh = desktopAge < audioStallMs_->value();
 		const bool micExpected = !states_[2].sourceName.isEmpty() && states_[2].enabled && states_[2].active;
+		const bool micStaleIfExpected = !micExpected || micAge >= audioStallMs_->value();
+		const bool bothAudioStalled = enableFreezeDetection_->isChecked() && videoFresh && micExpected &&
+					      desktopAge >= audioStallMs_->value() && micAge >= audioStallMs_->value();
+		const bool entireGroupStalled = enableFreezeDetection_->isChecked() && !videoFresh && !desktopFresh &&
+					       micStaleIfExpected;
 
 		const bool videoStalled = enableFreezeDetection_->isChecked() && desktopFresh &&
 					  videoAge >= videoStallMs_->value();
@@ -1329,6 +1593,8 @@ private:
 		updateConditionTimer(videoStalled, videoStallSinceNs_, now);
 		updateConditionTimer(desktopStalled, desktopStallSinceNs_, now);
 		updateConditionTimer(micStalled, micStallSinceNs_, now);
+		updateConditionTimer(bothAudioStalled, bothAudioStallSinceNs_, now);
+		updateConditionTimer(entireGroupStalled, entireGroupStallSinceNs_, now);
 
 		const double drift = currentDriftMs();
 		const bool driftExceeded = enableDriftDetection_->isChecked() && std::isfinite(drift) &&
@@ -1340,7 +1606,22 @@ private:
 		QString reason;
 		int confidence = 0;
 
-		if (videoStallSinceNs_ && now - videoStallSinceNs_ >= kStallConfirmNs) {
+		if (entireGroupStallSinceNs_ && now - entireGroupStallSinceNs_ >= kStallConfirmNs) {
+			issue = IssueKind::EntireGroupStall;
+			target = RecoveryTarget::EntireGroup;
+			confidence = 99;
+			reason = QStringLiteral("All mapped NDI streams are stale (video %1 ms, desktop audio %2 ms%3)")
+					 .arg(videoAge, 0, 'f', 0)
+					 .arg(desktopAge, 0, 'f', 0)
+					 .arg(micExpected ? QStringLiteral(", mic %1 ms").arg(micAge, 0, 'f', 0) : QString());
+		} else if (bothAudioStallSinceNs_ && now - bothAudioStallSinceNs_ >= kStallConfirmNs) {
+			issue = IssueKind::BothAudioStall;
+			target = RecoveryTarget::BothAudio;
+			confidence = 98;
+			reason = QStringLiteral("Both NDI audio sources are stale while video remains fresh (desktop %1 ms, mic %2 ms)")
+					 .arg(desktopAge, 0, 'f', 0)
+					 .arg(micAge, 0, 'f', 0);
+		} else if (videoStallSinceNs_ && now - videoStallSinceNs_ >= kStallConfirmNs) {
 			issue = IssueKind::VideoStall;
 			target = RecoveryTarget::Video;
 			confidence = 95;
@@ -1381,14 +1662,21 @@ private:
 					  .arg(recentJumpEvidence(now) ? QStringLiteral(" | recent timestamp jump") : QString()));
 
 		if (issue == IssueKind::None) {
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("healthy now");
+			clearSuggestedRecovery();
 			automationStatusLabel_->setText(QStringLiteral("Automation: %1 | healthy")
 							.arg(modeName(currentMode())));
 			lastObservedIssueKey_.clear();
 			return;
 		}
 
+		setSummaryIssue(issue, target);
+		currentSummaryState_ = QStringLiteral("current issue: %1; %2 suggested")
+					.arg(issueSummaryName(issue), targetName(target));
 		automationStatusLabel_->setText(QStringLiteral("Automation: %1 | issue detected: %2")
 						.arg(modeName(currentMode()), reason));
+		showSuggestedRecovery(target, reason, confidence);
 		handleDetectedIssue(now, issue, target, reason, confidence);
 	}
 
@@ -1407,6 +1695,8 @@ private:
 		videoStallSinceNs_ = 0;
 		desktopStallSinceNs_ = 0;
 		micStallSinceNs_ = 0;
+		bothAudioStallSinceNs_ = 0;
+		entireGroupStallSinceNs_ = 0;
 		driftSinceNs_ = 0;
 	}
 
@@ -1508,6 +1798,7 @@ private:
 				       static_cast<uint64_t>(verifyDelaySec_->value()) * kNsPerSecond;
 		detectionSuppressedUntilNs_ = recovery_.verifyAtNs;
 		resetConditionTimers();
+		showSuggestedRecovery(target, QStringLiteral("Automatic recovery is running: %1").arg(reason), currentConfidence_);
 		appendEvent(QStringLiteral("Automated recovery started: reset %1 because %2")
 				    .arg(targetName(target), reason));
 	}
@@ -1516,10 +1807,14 @@ private:
 	{
 		const bool recovered = recoverySucceeded(now);
 		if (recovered) {
+			verifiedRecoveryCount_++;
 			appendEvent(QStringLiteral("Recovery verified: %1 is fresh and the triggering condition cleared")
 					    .arg(targetName(recovery_.target)));
 			recovery_ = RecoveryAttempt{};
+			setSummaryIssue(IssueKind::None, RecoveryTarget::None);
+			currentSummaryState_ = QStringLiteral("healthy after a verified recovery");
 			detectionSuppressedUntilNs_ = now + 2ULL * kNsPerSecond;
+			clearSuggestedRecovery();
 			return;
 		}
 
@@ -1536,15 +1831,24 @@ private:
 				recovery_.verifyAtNs = now + static_cast<uint64_t>(pulseDurationMs_->value()) * kNsPerMs +
 						       static_cast<uint64_t>(verifyDelaySec_->value()) * kNsPerSecond;
 				detectionSuppressedUntilNs_ = recovery_.verifyAtNs;
+				showSuggestedRecovery(RecoveryTarget::EntireGroup,
+						      QStringLiteral("The targeted reset did not verify; a full-group rebuild is now running."),
+						      currentConfidence_);
 				appendEvent(QStringLiteral("Initial recovery did not verify; escalated to full NDI sync-group rebuild"));
 				return;
 			}
 		}
 
+		const RecoveryTarget failedTarget = recovery_.target;
+		failedRecoveryCount_++;
+		currentSummaryState_ = QStringLiteral("recovery verification failed; manual review suggested");
 		appendEvent(QStringLiteral("Recovery failed verification after %1. Automatic actions are now in cooldown; manual review required")
-				    .arg(targetName(recovery_.target)));
+				    .arg(targetName(failedTarget)));
 		recovery_ = RecoveryAttempt{};
 		detectionSuppressedUntilNs_ = now + static_cast<uint64_t>(cooldownSec_->value()) * kNsPerSecond;
+		showSuggestedRecovery(failedTarget == RecoveryTarget::EntireGroup ? RecoveryTarget::EntireGroup : failedTarget,
+				      QStringLiteral("Automatic verification failed. Review the live diagnostics, then use the highlighted recovery action if the problem remains."),
+				      100);
 	}
 
 	bool recoverySucceeded(uint64_t now) const
@@ -1553,6 +1857,10 @@ private:
 		const bool desktopFresh = packetAgeMs(1, now) < audioStallMs_->value() * 0.75;
 		const bool micFresh = packetAgeMs(2, now) < audioStallMs_->value() * 0.75;
 		switch (recovery_.issue) {
+		case IssueKind::EntireGroupStall:
+			return videoFresh && desktopFresh && (states_[2].sourceName.isEmpty() || micFresh);
+		case IssueKind::BothAudioStall:
+			return desktopFresh && micFresh;
 		case IssueKind::VideoStall:
 			return videoFresh;
 		case IssueKind::DesktopAudioStall:

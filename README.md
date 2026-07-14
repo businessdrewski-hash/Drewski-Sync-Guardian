@@ -86,19 +86,6 @@ C:\Program Files\obs-studio\
 
 Existing Sync Guardian mappings and settings should remain in the OBS plugin configuration directory.
 
-## Building with GitHub Actions
-
-The repository includes a Windows build workflow.
-
-1. Upload the repository files to GitHub.
-2. Open **Actions → Build Sync Guardian for Windows**.
-3. Run the workflow or wait for it to start after a commit.
-4. Open the successful workflow run.
-5. Download the Windows x64 artifact from the **Artifacts** section.
-6. Follow the installation steps above.
-
-No local Visual Studio, CMake, Qt, or OBS SDK installation is required when using GitHub Actions.
-
 ## Troubleshooting
 
 ### Sync Guardian is not listed under Docks

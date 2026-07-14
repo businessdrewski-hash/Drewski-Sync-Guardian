@@ -52,23 +52,48 @@ jobs:
           $ErrorActionPreference = 'Stop'
           .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Package Windows plugin ZIP
+      - name: Create drag-and-drop OBS package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE 'obs-install'
+          Remove-Item -Recurse -Force $packageRoot -ErrorAction SilentlyContinue
 
-      - name: Show produced files
-        shell: pwsh
-        run: |
-          Get-ChildItem -Recurse release | Select-Object FullName, Length
+          $pluginDir = Join-Path $packageRoot 'obs-plugins\64bit'
+          $localeDir = Join-Path $packageRoot 'data\obs-plugins\sync-guardian\locale'
+          New-Item -ItemType Directory -Force $pluginDir | Out-Null
+          New-Item -ItemType Directory -Force $localeDir | Out-Null
 
-      - name: Upload compiled plugin
+          $dll = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter 'sync-guardian.dll' |
+            Where-Object { $_.FullName -notmatch '\\.deps\\' -and $_.FullName -notmatch '\\obs-install\\' } |
+            Sort-Object @{ Expression = { if ($_.FullName -match 'RelWithDebInfo|Release') { 0 } else { 1 } } }, FullName |
+            Select-Object -First 1
+          if ($null -eq $dll) {
+            throw 'Could not locate the compiled sync-guardian.dll.'
+          }
+
+          Copy-Item -Force $dll.FullName (Join-Path $pluginDir 'sync-guardian.dll')
+          Copy-Item -Force "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" (Join-Path $localeDir 'en-US.ini')
+
+          @'
+          INSTALL SYNC GUARDIAN
+
+          1. Close OBS completely.
+          2. Drag the included "obs-plugins" and "data" folders into:
+             C:\Program Files\obs-studio\
+          3. Allow Windows to merge the folders.
+          4. Start OBS and open Docks > Sync Guardian.
+
+          Install this on the receiving/streaming PC.
+          '@ | Set-Content -Encoding utf8 (Join-Path $packageRoot 'INSTALL.txt')
+
+          Write-Host "Packaged files:"
+          Get-ChildItem -Recurse $packageRoot | Select-Object FullName, Length
+
+      - name: Upload install-ready plugin
         uses: actions/upload-artifact@v4
         with:
-          name: sync-guardian-0.2.0-windows-x64
-          path: |
-            release/*windows-x64*.zip
-            release/*windows-x64*.exe
+          name: sync-guardian-0.2.3-windows-x64
+          path: obs-install/
           if-no-files-found: error
           retention-days: 30

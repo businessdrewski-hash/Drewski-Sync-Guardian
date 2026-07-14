@@ -1,0 +1,7 @@
+1. Create a new EMPTY repository at github.com/new.
+2. Extract this package.
+3. In the empty repo: Add file > Upload files.
+4. Drag in EVERYTHING, including the .github folder, and commit.
+5. Click Actions > Build Sync Guardian for Windows > Run workflow.
+6. When green, open the run and download sync-guardian-0.2.0-windows-x64.
+7. Extract it and merge its obs-plugins and data folders into C:\Program Files\obs-studio\.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Sync Guardian v0.3.2 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
+// Sync Guardian v0.3.3 - OBS companion plugin for DistroAV/NDI monitoring and recovery.
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -59,7 +59,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("sync-guardian", "en-US")
 
 #ifndef PLUGIN_VERSION
-#define PLUGIN_VERSION "0.3.2"
+#define PLUGIN_VERSION "0.3.3"
 #endif
 
 namespace {
@@ -1030,36 +1030,66 @@ private:
 					      OBS_INVALID_HOTKEY_ID, OBS_INVALID_HOTKEY_ID,
 					      OBS_INVALID_HOTKEY_ID, OBS_INVALID_HOTKEY_ID};
 
-	QGroupBox *createCollapsibleSection(const QString &title, QWidget *parent, QWidget *&content,
-					     bool expanded = true)
+	QWidget *createCollapsibleSection(const QString &title, QWidget *parent, QWidget *&content,
+					 bool expanded = true)
 	{
-		auto *box = new QGroupBox(title, parent);
-		auto *boxLayout = new QVBoxLayout(box);
-		boxLayout->setContentsMargins(6, 5, 6, 6);
-		boxLayout->setSpacing(3);
+		auto *section = new QWidget(parent);
+		section->setProperty("collapsibleSection", true);
+		section->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
 
-		auto *header = new QHBoxLayout();
-		header->setContentsMargins(0, 0, 0, 0);
-		header->addStretch();
-		auto *toggle = new QToolButton(box);
+		auto *sectionLayout = new QVBoxLayout(section);
+		sectionLayout->setContentsMargins(0, 0, 0, 0);
+		sectionLayout->setSpacing(0);
+		sectionLayout->setSizeConstraint(QLayout::SetMinAndMaxSize);
+
+		auto *headerWidget = new QWidget(section);
+		headerWidget->setProperty("collapsibleHeader", true);
+		headerWidget->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+		headerWidget->setMinimumHeight(24);
+		headerWidget->setMaximumHeight(26);
+		auto *header = new QHBoxLayout(headerWidget);
+		header->setContentsMargins(6, 0, 4, 0);
+		header->setSpacing(3);
+
+		auto *titleLabel = new QLabel(title, headerWidget);
+		titleLabel->setProperty("collapsibleTitle", true);
+		titleLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+		header->addWidget(titleLabel, 1);
+
+		auto *toggle = new QToolButton(headerWidget);
 		toggle->setCheckable(true);
 		toggle->setChecked(expanded);
 		toggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
-		toggle->setText(expanded ? QStringLiteral("Hide") : QStringLiteral("Show"));
-		toggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+		toggle->setToolButtonStyle(Qt::ToolButtonIconOnly);
+		toggle->setAutoRaise(true);
+		toggle->setFixedSize(22, 22);
 		toggle->setToolTip(QStringLiteral("Show or hide this section."));
-		header->addWidget(toggle);
-		boxLayout->addLayout(header);
+		header->addWidget(toggle, 0, Qt::AlignRight | Qt::AlignVCenter);
+		sectionLayout->addWidget(headerWidget);
 
-		content = new QWidget(box);
+		content = new QWidget(section);
+		content->setProperty("collapsibleContent", true);
+		content->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+		content->setMinimumHeight(0);
+		content->setMaximumHeight(expanded ? QWIDGETSIZE_MAX : 0);
 		content->setVisible(expanded);
-		boxLayout->addWidget(content);
-		QObject::connect(toggle, &QToolButton::toggled, [content, toggle](bool shown) {
-			content->setVisible(shown);
-			toggle->setArrowType(shown ? Qt::DownArrow : Qt::RightArrow);
-			toggle->setText(shown ? QStringLiteral("Hide") : QStringLiteral("Show"));
-		});
-		return box;
+		sectionLayout->addWidget(content);
+
+		QObject::connect(toggle, &QToolButton::toggled, section,
+				 [section, content, toggle](bool shown) {
+					 content->setMaximumHeight(shown ? QWIDGETSIZE_MAX : 0);
+					 content->setVisible(shown);
+					 toggle->setArrowType(shown ? Qt::DownArrow : Qt::RightArrow);
+					 if (section->layout()) {
+						 section->layout()->invalidate();
+						 section->layout()->activate();
+					 }
+					 section->adjustSize();
+					 section->updateGeometry();
+					 if (section->parentWidget())
+						 section->parentWidget()->updateGeometry();
+				 });
+		return section;
 	}
 
 	void buildUi()
@@ -1071,12 +1101,14 @@ private:
 			compactFont.setPointSizeF(std::max(8.0, compactFont.pointSizeF() - 0.75));
 		panel_->setFont(compactFont);
 		panel_->setStyleSheet(QStringLiteral(
-			"#SyncGuardianPanel QGroupBox { margin-top: 7px; color: #e7ebf2; }"
-			"#SyncGuardianPanel QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 2px; color: #f0f3f8; }"
+			"#SyncGuardianPanel QWidget[collapsibleSection=\"true\"] { background-color: rgba(40, 44, 54, 150); border: 1px solid rgba(20, 23, 29, 165); border-radius: 4px; }"
+			"#SyncGuardianPanel QWidget[collapsibleHeader=\"true\"] { background: transparent; border: none; }"
+			"#SyncGuardianPanel QWidget[collapsibleContent=\"true\"] { background: transparent; border: none; margin: 0px; padding: 2px 5px 5px 5px; }"
+			"#SyncGuardianPanel QLabel[collapsibleTitle=\"true\"] { color: #f0f3f8; font-weight: 600; padding: 0px; margin: 0px; border: none; }"
 			"#SyncGuardianPanel QLabel, #SyncGuardianPanel QCheckBox { color: #dde3ec; }"
 			"#SyncGuardianPanel QTableWidget { color: #e2e7ef; }"
 			"#SyncGuardianPanel QPushButton { padding: 2px 5px; min-height: 20px; }"
-			"#SyncGuardianPanel QToolButton { color: #cfd6e1; padding: 1px 4px; }"
+			"#SyncGuardianPanel QToolButton { color: #cfd6e1; padding: 0px; margin: 0px; border: none; }"
 			"#SyncGuardianPanel QComboBox, #SyncGuardianPanel QSpinBox { min-height: 20px; }"
 			"#SyncGuardianPanel QToolTip { color: #f3f6fb; background-color: #2e3440; border: 1px solid #7f8a9a; }"));
 
@@ -1096,8 +1128,8 @@ private:
 		auto *scrollContent = new QWidget(scrollArea);
 		scrollContent->setObjectName(QStringLiteral("SyncGuardianScrollContent"));
 		auto *root = new QVBoxLayout(scrollContent);
-		root->setContentsMargins(5, 5, 5, 5);
-		root->setSpacing(5);
+		root->setContentsMargins(4, 4, 4, 4);
+		root->setSpacing(3);
 		root->setSizeConstraint(QLayout::SetMinAndMaxSize);
 
 		QWidget *sourceContent = nullptr;

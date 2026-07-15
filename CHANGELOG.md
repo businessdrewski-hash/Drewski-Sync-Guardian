@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.3
+
+- Rebuilt collapsible sections as compact one-line headers.
+- Collapsed sections now remove their content height completely.
+- Replaced large Show/Hide buttons with small chevrons.
+- Reduced UI padding and spacing throughout the dock.
+
 ## v0.3.2
 
 - Changed ordinary persistent-drift detection to use estimated corrected output drift whenever Adaptive Soft Sync is active.

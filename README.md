@@ -270,6 +270,12 @@ The source package itself does not include a precompiled Windows DLL.
 - Preserved DistroAV and OBS-level source properties during targeted resets and full-group rebuilds
 - Applied the same preservation behavior to saved-state restoration
 
+### v0.3.3 — Compact collapsible interface
+
+- True single-line collapsed headers
+- Small chevron toggles instead of large Show/Hide buttons
+- Reduced vertical padding and section spacing
+
 ### v0.3.2 — Corrected-drift logic and compact diagnostics
 
 - Changed persistent-drift evaluation to use corrected output drift while Adaptive Soft Sync is active

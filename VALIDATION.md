@@ -1,4 +1,4 @@
-# Validation notes — v0.3.2
+# Validation notes — v0.3.3
 
 Validated in the dependency-free model and source review:
 
@@ -10,6 +10,6 @@ Validated in the dependency-free model and source review:
 - Corrected drift beyond the configured threshold still triggers recovery.
 - Full-group and targeted reset restoration continue to use non-destructive settings updates and restore OBS-level source state.
 - Major UI sections are collapsible and technical diagnostics default to hidden.
-- GitHub Actions and installer metadata are v0.3.2.
+- GitHub Actions and installer metadata are v0.3.3.
 
 The Windows DLL and installer must still be compiled by the included GitHub Actions workflow for full OBS runtime validation.

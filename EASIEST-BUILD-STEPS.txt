@@ -1,7 +1,7 @@
-SYNC GUARDIAN v0.3.2 — EASIEST WINDOWS BUILD
+SYNC GUARDIAN v0.3.3 — EASIEST WINDOWS BUILD
 
 1. Replace the repository files with this package.
 2. Commit and push to GitHub.
 3. Open Actions > Build Sync Guardian for Windows.
-4. Download the artifact `sync-guardian-0.3.2-windows-x64`.
+4. Download the artifact `sync-guardian-0.3.3-windows-x64`.
 5. Run `SyncGuardian-Setup.exe`, or extract `SyncGuardian-Portable.zip` into the OBS installation folder.

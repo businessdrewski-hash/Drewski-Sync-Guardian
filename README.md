@@ -1,5 +1,9 @@
 # Sync Guardian for OBS Studio
 
+Hi — I’m a YouTuber, not a professional software developer. I created this project to solve A/V sync problems in my own two-PC OBS/NDI setup, with substantial assistance from AI during coding, debugging, and documentation.
+I’m making it public because the approach or code may help other people dealing with similar issues. This is an experimental, unofficial project provided as-is, without any guarantee that it will work with every system or remain compatible with future OBS, DistroAV, or NDI updates.
+I may not have the time or technical ability to provide updates, individual support, or troubleshooting. Please feel free to study, modify, improve, fork, and redistribute the code, subject to the GPL and any applicable third-party licenses. Use it at your own risk, and contributions or better implementations are welcome.
+
 **Sync Guardian** is an experimental OBS Studio plugin for people troubleshooting persistent A/V-sync problems in two-PC NDI® / DistroAV workflows.
 
 It runs on the **receiving or streaming PC**, watches the DistroAV sources already present in OBS, measures gradual drift and timestamp failures, and can recover an individual receiver or rebuild a mapped video/audio group without intentionally wiping the source settings you already configured.
